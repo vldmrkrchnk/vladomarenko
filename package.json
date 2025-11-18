@@ -1,0 +1,33 @@
+{
+  "name": "krapral-telegram-bot",
+  "version": "1.0.0",
+  "description": "Production-ready 24/7 Telegram bot embodying Krapral character",
+  "main": "dist/bot.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/bot.ts",
+    "build": "tsc",
+    "start": "node dist/bot.js",
+    "lint": "eslint src --ext .ts"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "grok",
+    "krapral"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "dotenv": "^16.6.1",
+    "openai": "^4.47.1",
+    "pino": "^9.14.0",
+    "pino-pretty": "^11.2.2",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.4"
+  }
+}
