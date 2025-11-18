@@ -4,7 +4,9 @@ import fs from 'fs';
 import axios from 'axios';
 import pino from 'pino';
 import OpenAI from 'openai';
+import { toFile } from 'openai';
 import http from 'http';
+import { Readable } from 'stream';
 import 'dotenv/config';
 
 // Logger: pretty-printed for local dev, JSON for GCP production
@@ -109,12 +111,13 @@ function formatName(user: any): string {
 // === СТРОГАЯ ЛОГИКА: Крапрал отвечает только когда действительно нужно ===
 function shouldKrapralSpeak(username: string, text: string): boolean {
 	const lower = text.toLowerCase();
+	logger.info(`[shouldKrapralSpeak] Checking "${text}" (lower: "${lower}") from ${username}`);
 
 	// 1. Прямой пинг — ВСЕГДА отвечаем (приоритет #1)
 	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
 
 	if (KRAPRAL_TRIGGERS.some(trigger => lower.includes(trigger))) {
-		logger.info(`Прямой пинг от ${username}`);
+		logger.info(`[ПРЯМОЙ ПИНГ] ${username} упомянул Крапрала → отвечаем`);
 		return true;
 	}
 
@@ -434,13 +437,8 @@ const bot = new Telegraf(TOKEN);
 
 bot.start(ctx => ctx.reply('Крапрал на посту. Пятая точка в строю.'));
 
-// Основной обработчик
-bot.on('text', async (ctx) => {
-	const msg = ctx.message;
-	const messageId = msg.message_id;
-	const username = formatName(msg.from);
-	const text = msg.text.trim();
-
+// Обработка входящего текста (используется для текстовых и транскрибированных сообщений)
+async function handleIncomingText(ctx: any, text: string, username: string, messageId: number) {
 	// КРИТИЧЕСКАЯ ЗАЩИТА: не реагируем на старые сообщения при запуске
 	if (processedMessageIds.has(messageId)) {
 		return; // уже видели это сообщение — молчим
@@ -458,9 +456,12 @@ bot.on('text', async (ctx) => {
 	saveHistory();
 
 	// Решаем: говорить или молчать
-	if (!shouldKrapralSpeak(username, text)) {
+	const shouldSpeak = shouldKrapralSpeak(username, text);
+	if (!shouldSpeak) {
+		logger.info(`[МОЛЧАНИЕ] Крапрал не отвечает на "${text}" от ${username}`);
 		return;
 	}
+	logger.info(`[ОТВЕТ] Крапрал решил ответить на "${text}" от ${username}`);
 
 	const result = await getKrapralResponse(text, username);
 	const apiName = result.api === 'openai' ? 'OpenAI (gpt-5.1)' : 'Grok (grok-4)';
@@ -476,7 +477,118 @@ bot.on('text', async (ctx) => {
 		timestamp: Date.now()
 	});
 	saveHistory();
+}
+
+// Основной обработчик текстовых сообщений
+bot.on('text', async (ctx) => {
+	const msg = ctx.message;
+	if (!msg || !msg.text) return;
+	
+	const messageId = msg.message_id;
+	const username = formatName(msg.from);
+	const text = msg.text.trim();
+
+	await handleIncomingText(ctx, text, username, messageId);
 });
+
+// Обработка аудио/голосовых/видео сообщений с транскрипцией
+async function handleAudioTranscription(ctx: any) {
+	const msg = ctx.message;
+	if (!msg) return;
+
+	const messageId = msg.message_id;
+	const username = formatName(ctx.from);
+
+	// КРИТИЧЕСКАЯ ЗАЩИТА: не реагируем на старые сообщения
+	if (processedMessageIds.has(messageId)) {
+		logger.debug(`Audio message ${messageId} already processed, skipping`);
+		return;
+	}
+	// НЕ добавляем messageId здесь - handleIncomingText сделает это
+
+	try {
+		logger.debug(`Processing audio/video message from ${username}, messageId: ${messageId}`);
+		
+		// Определяем file_id в зависимости от типа сообщения
+		let fileId: string;
+		if (msg.voice) {
+			fileId = msg.voice.file_id;
+			logger.debug(`Voice message detected, file_id: ${fileId}`);
+		} else if (msg.audio) {
+			fileId = msg.audio.file_id;
+			logger.debug(`Audio message detected, file_id: ${fileId}`);
+		} else if (msg.video) {
+			fileId = msg.video.file_id;
+			logger.debug(`Video message detected, file_id: ${fileId}`);
+		} else if (msg.video_note) {
+			fileId = msg.video_note.file_id;
+			logger.debug(`Video note detected, file_id: ${fileId}`);
+		} else {
+			logger.warn('Unknown media type in handleAudioTranscription');
+			return;
+		}
+
+		// Получаем ссылку на файл
+		logger.debug(`Getting file link for file_id: ${fileId}`);
+		const fileLink = await ctx.telegram.getFileLink(fileId);
+		logger.debug(`File link obtained: ${fileLink.toString()}`);
+		
+		// Скачиваем файл как поток (streaming, не сохраняем на диск)
+		logger.debug('Downloading file stream...');
+		const response = await axios.get(fileLink.toString(), {
+			responseType: 'stream'
+		});
+		
+		// Конвертируем axios stream в чистый Node.js Readable stream для OpenAI
+		// OpenAI требует чистый Readable stream без axios-специфичных свойств
+		logger.debug('Converting stream to buffer...');
+		const chunks: Buffer[] = [];
+		for await (const chunk of response.data) {
+			chunks.push(Buffer.from(chunk));
+		}
+		const audioBuffer = Buffer.concat(chunks);
+		logger.debug(`Audio buffer size: ${audioBuffer.length} bytes`);
+		
+		// OpenAI SDK требует File объект для Node.js
+		// Используем toFile() для конвертации Buffer в File
+		logger.debug('Converting buffer to File...');
+		const audioFile = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' });
+		
+		// Транскрибируем через OpenAI Whisper
+		logger.debug('Sending to OpenAI Whisper...');
+		const transcript = await openai.audio.transcriptions.create({
+			model: 'whisper-1',
+			file: audioFile,
+			language: 'ru'
+		});
+
+		const transcribedText = transcript.text.trim();
+
+		if (!transcribedText) {
+			logger.warn(`Empty transcription for audio message from ${username}`);
+			return; // Молча игнорируем, если не удалось распознать
+		}
+
+		logger.info(`Audio transcribed for ${username}: "${transcribedText}"`);
+
+		// Обрабатываем транскрибированный текст как обычное текстовое сообщение
+		await handleIncomingText(ctx, transcribedText, username, messageId);
+
+	} catch (error: any) {
+		logger.error({ 
+			error: error?.message || error,
+			stack: error?.stack,
+			response: error?.response?.data,
+			status: error?.response?.status,
+			username,
+			messageId
+		}, 'Error processing audio/video transcription');
+		// Молча игнорируем ошибки, не отправляем сообщения в чат
+	}
+}
+
+// Обработчики для всех типов медиа с аудио
+bot.on(['voice', 'audio', 'video', 'video_note'], handleAudioTranscription);
 
 // HTTP сервер для Cloud Run (health checks + webhook endpoint)
 // Cloud Run требует, чтобы контейнер слушал на порту (передается через переменную PORT)
