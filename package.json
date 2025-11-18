@@ -5,8 +5,12 @@
   "main": "dist/bot.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/bot.ts",
+    "dev:grok": "FORCE_API=grok ts-node-dev --respawn --transpile-only src/bot.ts",
+    "dev:openai": "FORCE_API=openai ts-node-dev --respawn --transpile-only src/bot.ts",
     "build": "tsc",
     "start": "node dist/bot.js",
+    "start:grok": "FORCE_API=grok node dist/bot.js",
+    "start:openai": "FORCE_API=openai node dist/bot.js",
     "lint": "eslint src --ext .ts"
   },
   "keywords": [
@@ -18,9 +22,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google-cloud/storage": "^7.7.0",
     "axios": "^1.13.2",
     "dotenv": "^16.6.1",
-    "openai": "^4.47.1",
+    "openai": "4.77.0",
     "pino": "^9.14.0",
     "pino-pretty": "^11.2.2",
     "telegraf": "^4.16.3"

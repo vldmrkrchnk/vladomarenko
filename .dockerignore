@@ -1,0 +1,16 @@
+node_modules
+dist
+*.log
+.env
+.git
+.gitignore
+README.md
+ecosystem.config.js
+.vscode
+.idea
+*.md
+.DS_Store
+last_50.json
+grok_requests.log
+openai_requests.log
+

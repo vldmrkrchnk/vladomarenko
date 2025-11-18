@@ -32,6 +32,16 @@ Production-ready 24/7 Telegram bot that 100% embodies the character "Krapral" as
 - npm or yarn
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
 - Grok API Key (from [x.ai](https://x.ai))
+- OpenAI API Key (from [OpenAI](https://platform.openai.com))
+
+## Quick Deploy to Google Cloud
+
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed deployment instructions.
+
+**Quick start:**
+```bash
+./deploy.sh YOUR_PROJECT_ID
+```
 
 ## Setup
 
@@ -49,7 +59,11 @@ Create/update `.env` file:
 TELEGRAM_TOKEN=your_telegram_bot_token_here
 GROK_API_KEY=your_grok_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
-LOG_LEVEL=info  # optional: debug, info, warn, error
+
+# Optional: Google Cloud Platform integration
+GCP_STORAGE_BUCKET=your-gcs-bucket-name  # For storing log files in Cloud Storage
+NODE_ENV=production                       # Enables JSON logging for Cloud Logging
+GCP_ENV=true                              # Alternative flag for GCP environment
 ```
 
 ### 3. Development Mode
@@ -135,6 +149,65 @@ sudo systemctl enable krapral-bot
 sudo systemctl start krapral-bot
 sudo systemctl status krapral-bot
 ```
+
+## Google Cloud Platform Integration
+
+The bot supports Google Cloud Platform for production deployment.
+
+### Features
+
+- **Cloud Logging**: Application logs (pino) automatically sent to GCP Cloud Logging when `NODE_ENV=production` or `GCP_ENV=true`
+- **Log Files**: Written to local files by default (works on Compute Engine VMs)
+- **Cloud Storage** (optional): Only needed for serverless services (Cloud Run, App Engine, Functions)
+
+### When Do You Need a Bucket?
+
+**You DON'T need a bucket if:**
+- Running on **Compute Engine** (VM) → Files are written to local disk (persistent if using persistent disk)
+- Running locally → Files are written to project directory
+
+**You DO need a bucket if:**
+- Running on **Cloud Run** → Ephemeral filesystem, files are lost on restart
+- Running on **App Engine** → Ephemeral filesystem
+- Running on **Cloud Functions** → Ephemeral filesystem
+
+### Setup
+
+#### Option 1: Compute Engine (No Bucket Needed)
+
+1. Deploy to a Compute Engine VM
+2. Logs are written to local files: `grok_requests.log`, `openai_requests.log`
+3. Access files via SSH or mount a persistent disk
+
+#### Option 2: Cloud Run / App Engine (Bucket Required)
+
+1. **Create a GCS Bucket**:
+   ```bash
+   gsutil mb gs://your-bucket-name
+   ```
+
+2. **Set up Authentication**:
+   - Service account is automatically configured for Cloud Run/App Engine
+   - For local testing: Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`
+
+3. **Configure Environment Variables**:
+   ```env
+   GCP_STORAGE_BUCKET=your-bucket-name  # Required for Cloud Run/App Engine
+   NODE_ENV=production                  # Enables JSON logging for Cloud Logging
+   ```
+
+4. **View Logs**:
+   - **Application logs**: GCP Console → Logging → Logs Explorer
+   - **Log files**: GCS Console → Your bucket → `logs/` folder
+   - **Sync log files locally**:
+     ```bash
+     gsutil -m rsync -r gs://your-bucket-name/logs ./logs
+     ```
+
+### Log Files Location
+
+- **Compute Engine / Local**: `grok_requests.log`, `openai_requests.log` (in project root)
+- **Cloud Storage** (if configured): `gs://your-bucket-name/logs/grok_requests.log`, `gs://your-bucket-name/logs/openai_requests.log`
 
 ## How It Works
 
