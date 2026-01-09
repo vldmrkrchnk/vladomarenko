@@ -8,8 +8,8 @@
 - [x] Package C completed
 - [x] Package D started
 - [x] Package D completed
-- [ ] Package E started
-- [ ] Package E completed
+- [x] Package E started
+- [x] Package E completed
 - [ ] Regression tests passed
 - [ ] Persona approved
 

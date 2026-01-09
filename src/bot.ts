@@ -172,6 +172,15 @@ function formatName(user: any): string {
 	return `@${(user.first_name || 'Аноним').replace(/\s/g, '_')}`;
 }
 
+// Safe reply function to handle errors (e.g. user blocked bot)
+async function safeReply(ctx: any, text: string) {
+	try {
+		await ctx.reply(text);
+	} catch (e: any) {
+		logger.warn({ error: e.message, user: ctx.from?.username }, 'Failed to send reply (user blocked bot?)');
+	}
+}
+
 // Должны ли мы вообще открывать рот?
 // === СТРОГАЯ ЛОГИКА: Крапрал отвечает только когда действительно нужно ===
 function shouldKrapralSpeak(username: string, text: string): boolean {
@@ -431,7 +440,7 @@ async function getKrapralResponseFromGrok(text: string, username: string, messag
 			url: err.config?.url
 		};
 		logger.error({ error: errorDetails }, 'Grok API error');
-		return 'Так точно... связь пропала. Пятая точка всё ещё в строю.';
+		return 'Связь с Grok перехвачена РЭБ противника. Повторите запрос, боец.';
 	}
 }
 
@@ -564,7 +573,7 @@ async function getKrapralResponseFromOpenAI(text: string, username: string, mess
 		return response;
 	} catch (err: any) {
 		logger.error('OpenAI API error:', err.message || err);
-		return 'Так точно... связь пропала. Пятая точка всё ещё в строю.';
+		return 'Спутники OpenAI сбиты. Перехожу на резервную частоту (попробуйте позже).';
 	}
 }
 
@@ -651,6 +660,7 @@ async function handleIncomingPhoto(ctx: any) {
 		enqueueMessage(ctx, caption, username, messageId, [dataUrl]);
 	} catch (error) {
 		logger.error({ error }, `Failed to process photo from ${username}`);
+		await safeReply(ctx, 'Товарищ боец, фото потеряно в тумане войны. Попробуйте еще раз.');
 	}
 }
 
@@ -857,7 +867,7 @@ async function processAccumulatedMessages() {
 	const apiName = apiToUse === 'openai' ? `OpenAI (${modelToUse})` : 'Grok (grok-4)';
 	logger.info(`Крапрал отвечает (Batch) | API: ${apiName}`);
 
-	await ctx.reply(resultText);
+	await safeReply(ctx, resultText);
 
 	// 4. Save Assistant Response
 	history.push({
@@ -883,7 +893,12 @@ bot.on('text', async (ctx) => {
 	const username = formatName(msg.from);
 	const text = msg.text.trim();
 
-	await handleIncomingText(ctx, text, username, messageId);
+	try {
+		await handleIncomingText(ctx, text, username, messageId);
+	} catch (e: any) {
+		logger.error({ error: e }, 'Error in text handler');
+		await safeReply(ctx, 'Боец, у нас помехи. Повторите сообщение.');
+	}
 });
 
 // Обработка аудио/голосовых/видео сообщений с транскрипцией
