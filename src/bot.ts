@@ -129,17 +129,34 @@ let accumulatedMessages: AccumulatedMessage[] = [];
 let debounceTimer: NodeJS.Timeout | null = null;
 
 // Загружаем список известных пользователей
-let knownUsers: Set<string> = new Set();
+// Загружаем список известных пользователей
+let knownUsers: Record<string, any> = {};
 if (fs.existsSync(USERS_FILE)) {
 	try {
 		const usersData = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
 		if (usersData.participants) {
-			knownUsers = new Set(Object.keys(usersData.participants));
-			logger.info(`Загружено ${knownUsers.size} известных пользователей из users.json`);
+			knownUsers = usersData.participants;
+			logger.info(`Загружено ${Object.keys(knownUsers).length} профилей пользователей из users.json`);
 		}
 	} catch (e) {
 		logger.error({ error: e }, 'Ошибка загрузки users.json');
 	}
+}
+
+function getUserProfile(username: string): string {
+	const profile = knownUsers[username];
+	if (!profile) return "User Profile: Unknown / New Recruit";
+
+	return `
+USER PROFILE (@${username}):
+- Role: ${profile.role_in_group}
+- Style: ${profile.communication_style}
+- Strengths: ${profile.strengths?.join(', ')}
+- Weaknesses: ${profile.weaknesses?.join(', ')}
+- Triggers: ${profile.triggers?.join(', ')}
+- INTERACTION PLAN: ${profile.ai_interaction_preferences?.tone}
+- AVOID: ${profile.ai_interaction_preferences?.avoid?.join(', ')}
+    `.trim();
 }
 
 // === ГЛАВНАЯ ЗАЩИТА ОТ СПАМА ПРИ ЗАПУСКЕ ===
@@ -181,6 +198,17 @@ async function safeReply(ctx: any, text: string) {
 	}
 }
 
+// Helper to apply reaction to a message
+async function applyReaction(ctx: any, reactionEmoji: string) {
+	try {
+		// Telegram API requires reaction object structure
+		await ctx.telegram.setMessageReaction(ctx.chat.id, ctx.message.message_id, [{ type: 'emoji', emoji: reactionEmoji }]);
+		logger.info(`[REACTION] Applied reaction: ${reactionEmoji}`);
+	} catch (e: any) {
+		logger.warn({ error: e.message }, `Failed to apply reaction ${reactionEmoji}`);
+	}
+}
+
 // Должны ли мы вообще открывать рот?
 // === СТРОГАЯ ЛОГИКА: Крапрал отвечает только когда действительно нужно ===
 function shouldKrapralSpeak(username: string, text: string): boolean {
@@ -208,7 +236,7 @@ function shouldKrapralSpeak(username: string, text: string): boolean {
 	}
 
 	// 2. Новый боец (не в users.json) — зачисляем в строй
-	if (!knownUsers.has(username)) {
+	if (!knownUsers[username]) {
 		logger.info(`[НОВЫЙ БОЕЦ] ${username} → приветствуем`);
 		return true;
 	}
@@ -407,7 +435,7 @@ ${response}
 // Ответ от Grok
 async function getKrapralResponseFromGrok(text: string, username: string, messagesOverride?: any[]): Promise<string> {
 	const messages = messagesOverride || [
-		{ role: 'system', content: IDENTITY },
+		{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(username)}` },
 		...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
 		{ role: 'user', name: username, content: text }
 	];
@@ -501,7 +529,7 @@ async function getKrapralResponseFromOpenAI(text: string, username: string, mess
 		: [
 			{
 				role: 'system',
-				content: `${IDENTITY}\n\nCURRENT CONTEXT:\n- Current Time: ${new Date().toLocaleTimeString()}\n- Current Mood: ${getRandomMood()} (Let this mood slightly color your response style, but keep the core persona).`
+				content: `${IDENTITY}\n\nCURRENT CONTEXT:\n- Current Time: ${new Date().toLocaleTimeString()}\n- Current Mood: ${getRandomMood()}\n\n${getUserProfile(username)}`
 			},
 			...history.map(m => ({
 				role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
@@ -799,20 +827,18 @@ async function processAccumulatedMessages() {
 
 	// Check if we have visual content (images) in the batch
 	const allImages = batch.flatMap(m => m.images || []);
-	let modelToUse = 'gpt-4.1'; // Default
-	let apiToUse: 'grok' | 'openai' = 'grok'; // Default per schedule unless vision needed
-	// Wait, we need to respect the original logic BUT if vision is needed we MUST use OpenAI
+	let modelToUse = 'gpt-4o'; // Default Primary
+	let apiToUse: 'grok' | 'openai' = 'openai';
 
 	let messagesForAi: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
 
+	// --- CONSTRUCT MESSAGES FOR OPENAI (PRIMARY) ---
 	if (allImages.length > 0) {
 		logger.info(`[VISION] Detected ${allImages.length} images in batch -> Forcing OpenAI (gpt-4o)`);
-		apiToUse = 'openai';
-		modelToUse = 'gpt-4o'; // Use 4o for vision
 
 		// Construct vision-compatible messages
 		messagesForAi = [
-			{ role: 'system', content: IDENTITY },
+			{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}` }, // Inject profile of first user (or maybe we should mix?) - simplifying to first
 			...history.map(m => ({
 				role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
 				content: m.name ? `${m.name}: ${m.content}` : m.content
@@ -826,7 +852,7 @@ async function processAccumulatedMessages() {
 		allImages.forEach(img => {
 			contentBlock.push({
 				type: 'image_url',
-				image_url: { url: img, detail: 'low' } // low detail is cheaper and usually sufficient for context
+				image_url: { url: img, detail: 'low' }
 			});
 		});
 
@@ -837,12 +863,9 @@ async function processAccumulatedMessages() {
 
 	} else {
 		// Standard text-only flow
-		const { api } = await getKrapralResponse(lastMsg.text, lastMsg.user, []); // Just to get API decision
-		apiToUse = api;
-
 		// Standard formatting
 		messagesForAi = [
-			{ role: 'system', content: IDENTITY },
+			{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}` },
 			...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
 			// Add batch texts
 			...batch.map(m => ({
@@ -852,28 +875,76 @@ async function processAccumulatedMessages() {
 		];
 	}
 
-	// Helper to call OpenAI with override
+	// --- EXECUTE STRATEGY: OPENAI PRIMARY, GROK FALLBACK ---
 	let resultText = '';
-	if (apiToUse === 'openai') {
+	let success = false;
+
+	// 1. Try OpenAI
+	try {
 		resultText = await getKrapralResponseFromOpenAI('', lastMsg.user, messagesForAi);
-	} else {
-		// Grok fallback (no images)
-		// We can't really pass the "batch" structure comfortably to Grok function as it expects standard text
-		// So we combine text manually and call usual function
-		const fullText = batch.map(m => m.text).join('\n---\n');
-		resultText = await getKrapralResponseFromGrok(fullText, batch[0].user); // Approximation
+		success = true;
+		apiToUse = 'openai';
+	} catch (openaiError: any) {
+		logger.error({ error: openaiError }, 'OpenAI Strategy failed. Attempting Fallback to Grok.');
+
+		// 2. Fallback to Grok (only if no images because Grok integration here is text-only?)
+		// Assuming current Grok implementation is text-only or we don't want to risk complex request
+		if (allImages.length === 0) {
+			try {
+				const fullText = batch.map(m => `${m.user}: ${m.text}`).join('\n---\n');
+				// Use profile context in Grok too (wrapper handles it if we pass simple text? No, wrapper needs override or we trust wrapper)
+				// Actually getKrapralResponseFromGrok constructs its own messages. We should just pass the text.
+				// WE WAIT: getKrapralResponseFromGrok takes (text, username). It injects context internally.
+				resultText = await getKrapralResponseFromGrok(fullText, batch[0].user);
+				success = true;
+				apiToUse = 'grok';
+				logger.info('Fallback to Grok successful.');
+			} catch (grokError: any) {
+				logger.error({ error: grokError }, 'Grok Fallback also failed.');
+			}
+		} else {
+			logger.warn('Cannot fallback to Grok because request contains images (Vision).');
+		}
 	}
 
-	const apiName = apiToUse === 'openai' ? `OpenAI (${modelToUse})` : 'Grok (grok-4)';
+	if (!success) {
+		// If both failed
+		await safeReply(ctx, 'Связь потеряна. Оба канала (OpenAI/Grok) лежат. Крапрал уходит в бункер.');
+		return;
+	}
+
+	const apiName = apiToUse === 'openai' ? `OpenAI (${modelToUse})` : 'Grok (Fallback)';
 	logger.info(`Крапрал отвечает (Batch) | API: ${apiName}`);
 
-	await safeReply(ctx, resultText);
+	// Parse [REACTION:Emoji] tag
+	const reactionMatch = resultText.match(/^\[REACTION:(.+?)\]/);
+	let finalResponse = resultText;
+
+	if (reactionMatch) {
+		const emoji = reactionMatch[1];
+		// Remove tag from text
+		finalResponse = resultText.replace(/^\[REACTION:.+?\]\s*/, '').trim();
+
+		// Apply reaction using context of the LAST message in batch (most relevant)
+		if (ctx) {
+			// Note: reaction logic is best effort.
+			// We use 'await' but don't block main reply if it fails?
+			// Actually, await is fine.
+			await applyReaction(ctx, emoji);
+		}
+	}
+
+	if (finalResponse) {
+		await safeReply(ctx, finalResponse);
+	} else {
+		logger.info('[BATCH] Response was only a reaction (empty text after strip), skipping text reply.');
+	}
 
 	// 4. Save Assistant Response
 	history.push({
 		role: 'assistant',
 		name: '@Krapral',
-		content: resultText,
+		content: resultText, // Save ORIGINAL with tag so context knows we reacted
 		timestamp: Date.now()
 	});
 	saveHistory();
