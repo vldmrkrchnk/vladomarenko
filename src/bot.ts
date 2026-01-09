@@ -62,6 +62,18 @@ const GROK_LOGS_FILE = 'grok_requests.log';
 const OPENAI_LOGS_FILE = 'openai_requests.log';
 const MIN_MESSAGES_BETWEEN_RESPONSES = 5; // Увеличено до 5 сообщений между ответами
 const USERS_FILE = 'users.json';
+const DEBOUNCE_DELAY = 4000; // 4 seconds debounce
+
+// Accumulator for debounce logic
+interface AccumulatedMessage {
+	user: string;
+	text: string;
+	messageId: number;
+	timestamp: number;
+	ctx: any;
+}
+let accumulatedMessages: AccumulatedMessage[] = [];
+let debounceTimer: NodeJS.Timeout | null = null;
 
 // Загружаем список известных пользователей
 let knownUsers: Set<string> = new Set();
@@ -135,37 +147,47 @@ function shouldKrapralSpeak(username: string, text: string): boolean {
 	}
 
 	// Считаем сообщения ПОСЛЕ последнего ответа Крапрала
-	const messagesSinceLastResponse = history.filter(m => 
+	const messagesSinceLastResponse = history.filter(m =>
 		m.timestamp > lastKrapralResponse.timestamp && m.role === 'user'
 	).length;
 
-	// Если прошло меньше MIN_MESSAGES_BETWEEN_RESPONSES сообщений — МОЛЧИМ
-	if (messagesSinceLastResponse < MIN_MESSAGES_BETWEEN_RESPONSES) {
-		logger.debug(`[КУЛДАУН] Прошло только ${messagesSinceLastResponse} сообщений, нужно минимум ${MIN_MESSAGES_BETWEEN_RESPONSES}`);
-		return false;
-	}
+	// 4. Проверяем: есть ли в текущем сообщении вопрос?
+	const currentMessageHasQuestion = /\?/.test(text) ||
+		/\b(что|как|когда|где|почему|кто|отзовись|слышит|слушаешь)\b/i.test(text);
 
-	// 4. Если прошло достаточно сообщений, но это просто случайный чат — тоже молчим
-	// Проверяем: есть ли в последних сообщениях что-то, что требует ответа?
-	const recentMessages = history.slice(-10).filter(m => m.role === 'user');
-	const hasQuestion = recentMessages.some(m => 
-		/\?/.test(m.content) || 
-		/\b(что|как|когда|где|почему|кто)\b/i.test(m.content)
-	);
-	
-	// Если есть вопрос И прошло достаточно сообщений — отвечаем
-	if (hasQuestion && messagesSinceLastResponse >= MIN_MESSAGES_BETWEEN_RESPONSES) {
-		logger.info(`[ВОПРОС] ${username} задал вопрос, прошло ${messagesSinceLastResponse} сообщений → отвечаем`);
+	// Если текущее сообщение содержит вопрос — отвечаем (даже если не прошло 5 сообщений)
+	if (currentMessageHasQuestion) {
+		logger.info(`[ВОПРОС В ТЕКУЩЕМ СООБЩЕНИИ] ${username} задал вопрос → отвечаем`);
 		return true;
 	}
 
-	// 5. Если прошло ОЧЕНЬ много сообщений (10+) — можно вмешаться
+	// Если прошло меньше MIN_MESSAGES_BETWEEN_RESPONSES сообщений — МОЛЧИМ
+	if (messagesSinceLastResponse < MIN_MESSAGES_BETWEEN_RESPONSES) {
+		logger.info(`[КУЛДАУН] Прошло только ${messagesSinceLastResponse} сообщений, нужно минимум ${MIN_MESSAGES_BETWEEN_RESPONSES} → молчим`);
+		return false;
+	}
+
+	// 5. Если прошло достаточно сообщений, проверяем: есть ли в последних сообщениях что-то, что требует ответа?
+	const recentMessages = history.slice(-10).filter(m => m.role === 'user');
+	const hasQuestion = recentMessages.some(m =>
+		/\?/.test(m.content) ||
+		/\b(что|как|когда|где|почему|кто)\b/i.test(m.content)
+	);
+
+	// Если есть вопрос И прошло достаточно сообщений — отвечаем
+	if (hasQuestion && messagesSinceLastResponse >= MIN_MESSAGES_BETWEEN_RESPONSES) {
+		logger.info(`[ВОПРОС В ИСТОРИИ] ${username} задал вопрос, прошло ${messagesSinceLastResponse} сообщений → отвечаем`);
+		return true;
+	}
+
+	// 6. Если прошло ОЧЕНЬ много сообщений (10+) — можно вмешаться
 	if (messagesSinceLastResponse >= 10) {
 		logger.info(`[ДОЛГОЕ МОЛЧАНИЕ] Прошло ${messagesSinceLastResponse} сообщений → можно ответить`);
 		return true;
 	}
 
 	// Во всех остальных случаях — МОЛЧИМ
+	logger.info(`[НЕТ ПРИЧИНЫ ОТВЕЧАТЬ] Прошло ${messagesSinceLastResponse} сообщений, нет вопросов, нет долгого молчания → молчим`);
 	return false;
 }
 
@@ -175,12 +197,12 @@ function decideAPI(): 'grok' | 'openai' {
 	if (FORCE_API === 'grok' || FORCE_API === 'openai') {
 		return FORCE_API;
 	}
-	
+
 	// Иначе используем логику на основе секунды
 	const now = new Date();
 	const second = now.getSeconds();
 	const lastDigit = second % 10;
-	
+
 	// Если последняя цифра 1,3,5,7,9 → OpenAI
 	// Если последняя цифра 0,2,4,6,8 → Grok
 	if ([1, 3, 5, 7, 9].includes(lastDigit)) {
@@ -231,19 +253,19 @@ async function logGrokRequest(messages: any[], response: string, username: strin
 	try {
 		const timestamp = new Date().toISOString();
 		const identity = IDENTITY.substring(0, 30) + (IDENTITY.length > 30 ? '...' : '');
-		
+
 		// Форматируем сообщения для лога (исключаем system, показываем первые 100 символов)
 		const messagesPreview = messages
 			.filter(m => m.role !== 'system')
 			.map(m => {
 				const name = m.name ? `${m.name}: ` : '';
-				const content = m.content.length > 100 
-					? m.content.substring(0, 100) + '...' 
+				const content = m.content.length > 100
+					? m.content.substring(0, 100) + '...'
 					: m.content;
 				return `  [${m.role}] ${name}${content}`;
 			})
 			.join('\n');
-		
+
 		const logEntry = `
 ================================================================================
 [${timestamp}] Grok Request from @${username}
@@ -267,23 +289,23 @@ ${response}
 }
 
 // Логирование запросов к OpenAI
-async function logOpenAIRequest(messages: any[], response: string, username: string, model: string = 'gpt-5.1'): Promise<void> {
+async function logOpenAIRequest(messages: any[], response: string, username: string, model: string = 'gpt-4.1'): Promise<void> {
 	try {
 		const timestamp = new Date().toISOString();
 		const identity = IDENTITY.substring(0, 30) + (IDENTITY.length > 30 ? '...' : '');
-		
+
 		// Форматируем сообщения для лога (исключаем system, показываем первые 100 символов)
 		const messagesPreview = messages
 			.filter(m => m.role !== 'system')
 			.map(m => {
 				const name = m.name ? `${m.name}: ` : '';
-				const content = m.content.length > 100 
-					? m.content.substring(0, 100) + '...' 
+				const content = m.content.length > 100
+					? m.content.substring(0, 100) + '...'
 					: m.content;
 				return `  [${m.role}] ${name}${content}`;
 			})
 			.join('\n');
-		
+
 		const logEntry = `
 ================================================================================
 [${timestamp}] OpenAI Request from @${username}
@@ -307,8 +329,8 @@ ${response}
 }
 
 // Ответ от Grok
-async function getKrapralResponseFromGrok(text: string, username: string): Promise<string> {
-	const messages = [
+async function getKrapralResponseFromGrok(text: string, username: string, messagesOverride?: any[]): Promise<string> {
+	const messages = messagesOverride || [
 		{ role: 'system', content: IDENTITY },
 		...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
 		{ role: 'user', name: username, content: text }
@@ -328,10 +350,10 @@ async function getKrapralResponseFromGrok(text: string, username: string): Promi
 		});
 
 		const response = res.data.choices[0].message.content.trim();
-		
+
 		// Логируем запрос и ответ
 		await logGrokRequest(messages, response, username);
-		
+
 		return response;
 	} catch (err: any) {
 		const errorDetails = {
@@ -347,59 +369,45 @@ async function getKrapralResponseFromGrok(text: string, username: string): Promi
 }
 
 // Ответ от OpenAI
-async function getKrapralResponseFromOpenAI(text: string, username: string): Promise<string> {
+async function getKrapralResponseFromOpenAI(text: string, username: string, messagesOverride?: any[]): Promise<string> {
 	// Форматируем сообщения для OpenAI (без name поля, включаем в content)
-	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-		{
-			role: 'system',
-			content: IDENTITY
-		},
-		...history.map(m => ({
-			role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-			content: m.name ? `${m.name}: ${m.content}` : m.content
-		})),
-		{
-			role: 'user',
-			content: `${username}: ${text}`
-		}
-	];
+	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = messagesOverride ?
+		// If override provided, we assume it's already qualified (but OpenAI matches specifically)
+		// We might need to map it if it has 'name' which OpenAI supports but strictly
+		messagesOverride.map(m => ({
+			role: m.role,
+			content: m.name && m.role !== 'system' ? `${m.name}: ${m.content}` : m.content
+		}))
+		: [
+			{
+				role: 'system',
+				content: IDENTITY
+			},
+			...history.map(m => ({
+				role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+				content: m.name ? `${m.name}: ${m.content}` : m.content
+			})),
+			{
+				role: 'user',
+				content: `${username}: ${text}`
+			}
+		];
 
 	try {
-		// Try GPT-5.1 first (latest), fallback to gpt-4o if not available
-		let model = 'gpt-5.1'; // Latest OpenAI model
-		let completion;
-		
-		try {
-			completion = await openai.chat.completions.create({
-				model: model,
-				messages: messages,
-				temperature: 1.2, // Increased for more variety and creativity
-				max_tokens: 500,
-				top_p: 0.95, // Nucleus sampling for more diverse outputs
-				frequency_penalty: 0.7, // Penalize repetition
-				presence_penalty: 0.6 // Encourage new topics
-			});
-		} catch (modelError: any) {
-			// If GPT-5.1 is not available, fallback to gpt-4o
-			if (modelError.message?.includes('model') || modelError.status === 404) {
-				logger.warn('GPT-5.1 not available, falling back to gpt-4o');
-				model = 'gpt-4o';
-				completion = await openai.chat.completions.create({
-					model: model,
-					messages: messages,
-					temperature: 1.2, // Increased for more variety
-					max_tokens: 500,
-					top_p: 0.95,
-					frequency_penalty: 0.7,
-					presence_penalty: 0.6
-				});
-			} else {
-				throw modelError;
-			}
-		}
+		// Use GPT-4.1 as the primary and stable chat model
+		const model = 'gpt-4.1';
+		const completion = await openai.chat.completions.create({
+			model: model,
+			messages: messages,
+			temperature: 1.2, // Increased for more variety and creativity
+			max_tokens: 500,
+			top_p: 0.95, // Nucleus sampling for more diverse outputs
+			frequency_penalty: 0.7, // Penalize repetition
+			presence_penalty: 0.6 // Encourage new topics
+		});
 
 		const response = completion.choices[0]?.message?.content?.trim() || '';
-		
+
 		// Логируем запрос и ответ (используем оригинальный формат для лога)
 		const originalMessages = [
 			{ role: 'system', content: IDENTITY },
@@ -407,7 +415,7 @@ async function getKrapralResponseFromOpenAI(text: string, username: string): Pro
 			{ role: 'user', name: username, content: text }
 		];
 		await logOpenAIRequest(originalMessages, response, username, model);
-		
+
 		return response;
 	} catch (err: any) {
 		logger.error('OpenAI API error:', err.message || err);
@@ -416,19 +424,19 @@ async function getKrapralResponseFromOpenAI(text: string, username: string): Pro
 }
 
 // Главная функция получения ответа (выбирает API на основе секунды)
-async function getKrapralResponse(text: string, username: string): Promise<{ response: string; api: 'grok' | 'openai' }> {
+async function getKrapralResponse(text: string, username: string, messagesOverride?: any[]): Promise<{ response: string; api: 'grok' | 'openai' }> {
 	const api = decideAPI();
 	const now = new Date();
 	const second = now.getSeconds();
 	logger.info(`Using ${api.toUpperCase()} API (based on current second: ${second})`);
-	
+
 	let response: string;
 	if (api === 'openai') {
-		response = await getKrapralResponseFromOpenAI(text, username);
+		response = await getKrapralResponseFromOpenAI(text, username, messagesOverride);
 	} else {
-		response = await getKrapralResponseFromGrok(text, username);
+		response = await getKrapralResponseFromGrok(text, username, messagesOverride);
 	}
-	
+
 	return { response, api };
 }
 
@@ -437,39 +445,127 @@ const bot = new Telegraf(TOKEN);
 
 bot.start(ctx => ctx.reply('Крапрал на посту. Пятая точка в строю.'));
 
-// Обработка входящего текста (используется для текстовых и транскрибированных сообщений)
+// Обработка входящего текста (используется для текстовых сообщений)
+// Добавляем сообщение в очередь (debounce)
+function enqueueMessage(ctx: any, text: string, username: string, messageId: number) {
+	accumulatedMessages.push({
+		user: username,
+		text: text,
+		messageId: messageId,
+		timestamp: Date.now(),
+		ctx: ctx
+	});
+
+	logger.info(`[DEBOUNCE] Message buffered from ${username}. Queue size: ${accumulatedMessages.length}`);
+
+	if (debounceTimer) {
+		clearTimeout(debounceTimer);
+	}
+
+	debounceTimer = setTimeout(async () => {
+		await processAccumulatedMessages();
+	}, DEBOUNCE_DELAY);
+}
+
+// Обработка входящего текста (используется для текстовых сообщений)
 async function handleIncomingText(ctx: any, text: string, username: string, messageId: number) {
 	// КРИТИЧЕСКАЯ ЗАЩИТА: не реагируем на старые сообщения при запуске
 	if (processedMessageIds.has(messageId)) {
+		logger.debug(`[ПРОПУСК] Текстовое сообщение ${messageId} от ${username} уже обработано`);
 		return; // уже видели это сообщение — молчим
 	}
 	processedMessageIds.add(messageId);
 
-	// Сохраняем сообщение пользователя + его Telegram ID
-	history.push({
-		role: 'user',
-		name: username,
-		content: text,
-		timestamp: Date.now(),
-		message_id: messageId
+	enqueueMessage(ctx, text, username, messageId);
+}
+
+// Logic to process the accumulated batch
+async function processAccumulatedMessages() {
+	if (accumulatedMessages.length === 0) return;
+
+	// Snapshot and clear
+	const batch = [...accumulatedMessages];
+	accumulatedMessages = [];
+	debounceTimer = null;
+
+	// Sort by timestamp just in case
+	batch.sort((a, b) => a.timestamp - b.timestamp);
+
+	logger.info(`[BATCH] Processing ${batch.length} messages`);
+
+	// 1. Add ALL messages to history first
+	batch.forEach(msg => {
+		history.push({
+			role: 'user',
+			name: msg.user,
+			content: msg.text,
+			timestamp: msg.timestamp,
+			message_id: msg.messageId
+		});
 	});
 	saveHistory();
 
-	// Решаем: говорить или молчать
-	const shouldSpeak = shouldKrapralSpeak(username, text);
+	// 2. Decide if we should speak based on the entire batch
+	// We check if ANY message in the batch triggers a response
+	const lastMsg = batch[batch.length - 1];
+	const ctx = lastMsg.ctx; // Reply using the context of the last message
+
+	// Check triggers across the whole batch
+	let shouldSpeak = false;
+	let triggerReason = '';
+
+	// Check 1: Direct triggers in ANY message
+	const combinedText = batch.map(b => b.text).join(' . ');
+	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
+	if (KRAPRAL_TRIGGERS.some(trigger => combinedText.toLowerCase().includes(trigger))) {
+		shouldSpeak = true;
+		triggerReason = 'Direct trigger in batch';
+	}
+
+	// Check 2: New User (any in batch) -> Checked via knownUsers against each user? 
+	// The original logic checked knownUsers inside shouldKrapralSpeak. 
+	// We should probably rely on the existing function for consistency but adapt it.
+
 	if (!shouldSpeak) {
-		logger.info(`[МОЛЧАНИЕ] Крапрал не отвечает на "${text}" от ${username}`);
+		// Iterate and check standard logic for each
+		for (const msg of batch) {
+			// Note: This calls the ORIGINAL shouldKrapralSpeak which checks history.
+			// Since we just added all items to history, the "history" check inside might be slightly skewed
+			// because "messagesSinceLastResponse" will include the current batch items we just added.
+			// This is actually GOOD: it means larger batches increase the "count" automatically.
+			if (shouldKrapralSpeak(msg.user, msg.text)) {
+				shouldSpeak = true;
+				triggerReason = `Logic for msg from ${msg.user}`;
+				break;
+			}
+		}
+	}
+
+	if (!shouldSpeak) {
+		logger.info(`[BATCH SILENCE] Processed ${batch.length} messages, decided not to answer.`);
 		return;
 	}
-	logger.info(`[ОТВЕТ] Крапрал решил ответить на "${text}" от ${username}`);
 
-	const result = await getKrapralResponse(text, username);
-	const apiName = result.api === 'openai' ? 'OpenAI (gpt-5.1)' : 'Grok (grok-4)';
-	logger.info(`Крапрал отвечает ${username} | API: ${apiName}`);
+	logger.info(`[BATCH REPLY] Decided to answer. Reason: ${triggerReason}`);
+
+	// 3. Generate Response
+	// We need to pass the FULL history (which now includes the batch) to the AI.
+	// We use the 'messagesOverride' parameter we added.
+	const promptMessages = [
+		{ role: 'system', content: IDENTITY },
+		...history.map(m => ({ role: m.role, name: m.name, content: m.content }))
+	];
+
+	// Determine the "username" to address (usually the last one or the one who triggered)
+	const targetUser = lastMsg.user;
+
+	const result = await getKrapralResponse(lastMsg.text, targetUser, promptMessages);
+	const apiName = result.api === 'openai' ? 'OpenAI (gpt-4.1)' : 'Grok (grok-4)';
+	logger.info(`Крапрал отвечает (Batch) | API: ${apiName}`);
 
 	await ctx.reply(result.response);
 
-	// Сохраняем свой ответ
+	// 4. Save Assistant Response
 	history.push({
 		role: 'assistant',
 		name: '@Krapral',
@@ -479,11 +575,18 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	saveHistory();
 }
 
+// Обработка транскрибированного текста (для голосовых сообщений)
+// messageId уже добавлен в processedMessageIds при начале обработки голосового
+async function handleIncomingTextAfterTranscription(ctx: any, text: string, username: string, messageId: number) {
+	// messageId уже в processedMessageIds, просто добавляем в очередь
+	enqueueMessage(ctx, text, username, messageId);
+}
+
 // Основной обработчик текстовых сообщений
 bot.on('text', async (ctx) => {
 	const msg = ctx.message;
 	if (!msg || !msg.text) return;
-	
+
 	const messageId = msg.message_id;
 	const username = formatName(msg.from);
 	const text = msg.text.trim();
@@ -501,14 +604,16 @@ async function handleAudioTranscription(ctx: any) {
 
 	// КРИТИЧЕСКАЯ ЗАЩИТА: не реагируем на старые сообщения
 	if (processedMessageIds.has(messageId)) {
-		logger.debug(`Audio message ${messageId} already processed, skipping`);
+		logger.info(`[ПРОПУСК] Голосовое сообщение ${messageId} от ${username} уже обрабатывается или обработано`);
 		return;
 	}
-	// НЕ добавляем messageId здесь - handleIncomingText сделает это
+
+	// ВАЖНО: Добавляем messageId СРАЗУ, чтобы предотвратить параллельную обработку
+	// Если придет еще одно голосовое во время обработки этого - оно будет пропущено
+	processedMessageIds.add(messageId);
+	logger.info(`[НАЧАЛО ОБРАБОТКИ] Голосовое сообщение ${messageId} от ${username} - начинаю транскрипцию...`);
 
 	try {
-		logger.debug(`Processing audio/video message from ${username}, messageId: ${messageId}`);
-		
 		// Определяем file_id в зависимости от типа сообщения
 		let fileId: string;
 		if (msg.voice) {
@@ -532,13 +637,13 @@ async function handleAudioTranscription(ctx: any) {
 		logger.debug(`Getting file link for file_id: ${fileId}`);
 		const fileLink = await ctx.telegram.getFileLink(fileId);
 		logger.debug(`File link obtained: ${fileLink.toString()}`);
-		
+
 		// Скачиваем файл как поток (streaming, не сохраняем на диск)
 		logger.debug('Downloading file stream...');
 		const response = await axios.get(fileLink.toString(), {
 			responseType: 'stream'
 		});
-		
+
 		// Конвертируем axios stream в чистый Node.js Readable stream для OpenAI
 		// OpenAI требует чистый Readable stream без axios-специфичных свойств
 		logger.debug('Converting stream to buffer...');
@@ -548,12 +653,12 @@ async function handleAudioTranscription(ctx: any) {
 		}
 		const audioBuffer = Buffer.concat(chunks);
 		logger.debug(`Audio buffer size: ${audioBuffer.length} bytes`);
-		
+
 		// OpenAI SDK требует File объект для Node.js
 		// Используем toFile() для конвертации Buffer в File
 		logger.debug('Converting buffer to File...');
 		const audioFile = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' });
-		
+
 		// Транскрибируем через OpenAI Whisper
 		logger.debug('Sending to OpenAI Whisper...');
 		const transcript = await openai.audio.transcriptions.create({
@@ -569,20 +674,23 @@ async function handleAudioTranscription(ctx: any) {
 			return; // Молча игнорируем, если не удалось распознать
 		}
 
-		logger.info(`Audio transcribed for ${username}: "${transcribedText}"`);
+		logger.info(`[ТРАНСКРИПЦИЯ ЗАВЕРШЕНА] Голосовое ${messageId} от ${username}: "${transcribedText}"`);
 
 		// Обрабатываем транскрибированный текст как обычное текстовое сообщение
-		await handleIncomingText(ctx, transcribedText, username, messageId);
+		// messageId уже в processedMessageIds, используем специальную функцию
+		await handleIncomingTextAfterTranscription(ctx, transcribedText, username, messageId);
 
 	} catch (error: any) {
-		logger.error({ 
+		logger.error({
 			error: error?.message || error,
 			stack: error?.stack,
 			response: error?.response?.data,
 			status: error?.response?.status,
 			username,
 			messageId
-		}, 'Error processing audio/video transcription');
+		}, `[ОШИБКА ТРАНСКРИПЦИИ] Голосовое сообщение ${messageId} от ${username}`);
+		// ВАЖНО: messageId уже в processedMessageIds, поэтому повторная обработка не произойдет
+		// Это нормально - лучше пропустить одно сообщение, чем обрабатывать дубликаты
 		// Молча игнорируем ошибки, не отправляем сообщения в чат
 	}
 }
@@ -600,7 +708,7 @@ const server = http.createServer(async (req, res) => {
 		res.end(JSON.stringify({ status: 'ok', service: 'krapral-bot' }));
 		return;
 	}
-	
+
 	// Telegram webhook endpoint
 	if (req.url === '/webhook' && req.method === 'POST') {
 		let body = '';
@@ -618,7 +726,7 @@ const server = http.createServer(async (req, res) => {
 		});
 		return;
 	}
-	
+
 	// 404 for other routes
 	res.writeHead(404, { 'Content-Type': 'text/plain' });
 	res.end('Not Found');
@@ -626,15 +734,15 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, async () => {
 	logger.info(`HTTP server listening on port ${PORT}`);
-	
+
 	// Use webhooks in production (Cloud Run), polling in development
 	if (process.env.NODE_ENV === 'production' || process.env.USE_WEBHOOK === 'true') {
 		// Webhook mode for Cloud Run
 		// Get the service URL from environment (Cloud Run sets K_SERVICE_URL) or use WEBHOOK_URL
-		const webhookUrl = process.env.WEBHOOK_URL || process.env.K_SERVICE_URL 
+		const webhookUrl = process.env.WEBHOOK_URL || process.env.K_SERVICE_URL
 			? `${process.env.WEBHOOK_URL || process.env.K_SERVICE_URL}/webhook`
 			: null;
-		
+
 		if (webhookUrl) {
 			try {
 				await bot.telegram.setWebhook(webhookUrl);
@@ -654,7 +762,7 @@ server.listen(PORT, async () => {
 		bot.launch({ dropPendingUpdates: true });
 		logger.info('Крапрал 3.0 на боевом дежурстве (Polling mode)');
 	}
-	
+
 	// Показываем режим работы при запуске
 	if (FORCE_API) {
 		logger.info(`РЕЖИМ: ${FORCE_API.toUpperCase()} (принудительный, секунды игнорируются)`);
