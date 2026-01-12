@@ -159,6 +159,20 @@ USER PROFILE (@${username}):
     `.trim();
 }
 
+// Helper: Get list of all users for "Summon All" logic
+function getSquadRoster(): string {
+	if (Object.keys(knownUsers).length === 0) return "";
+	const list = Object.keys(knownUsers).map(uName => {
+		const u = knownUsers[uName];
+		// Take first part of role
+		const shortRole = u.role_in_group ? u.role_in_group.split('/')[0].trim() : 'Fighter';
+		// Add aliases if present
+		const aliasStr = (u.aliases && u.aliases.length > 0) ? ` [Aliases: ${u.aliases.join(', ')}]` : '';
+		return `- ${uName} (${shortRole})${aliasStr}`;
+	}).join('\n');
+	return `FULL SQUAD ROSTER (Use these usernames to summon/mention everyone):\n${list}`;
+}
+
 // === ГЛАВНАЯ ЗАЩИТА ОТ СПАМА ПРИ ЗАПУСКЕ ===
 const processedMessageIds = new Set<number>();
 
@@ -209,6 +223,17 @@ async function applyReaction(ctx: any, reactionEmoji: string) {
 	}
 }
 
+// Helper to send a Poll
+async function sendPoll(ctx: any, question: string, options: string[]) {
+	try {
+		await ctx.replyWithPoll(question, options, { is_anonymous: false });
+		logger.info(`[POLL] Sent poll: "${question}" with ${options.length} options`);
+	} catch (e: any) {
+		logger.error({ error: e.message }, 'Failed to send poll');
+		await safeReply(ctx, 'Не могу создать опрос. Бюрократия заела.');
+	}
+}
+
 // Должны ли мы вообще открывать рот?
 // === СТРОГАЯ ЛОГИКА: Крапрал отвечает только когда действительно нужно ===
 function shouldKrapralSpeak(username: string, text: string): boolean {
@@ -216,9 +241,13 @@ function shouldKrapralSpeak(username: string, text: string): boolean {
 	logger.info(`[shouldKrapralSpeak] Checking "${text}" (lower: "${lower}") from ${username}`);
 
 	// 1. Прямой пинг — ВСЕГДА отвечаем (приоритет #1)
+	// 1. Прямой пинг — ВСЕГДА отвечаем (приоритет #1)
 	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
+	// Homoglyph-robust regex: Matches mixed Latin/Cyrillic variations of "Kapral"
+	// К/K, а/a, п/p, р/r, а/a, л/l
+	const HOMOGLYPH_REGEX = /[КKкk][аa][пp][рr][аa][лl]/i;
 
-	if (KRAPRAL_TRIGGERS.some(trigger => lower.includes(trigger))) {
+	if (KRAPRAL_TRIGGERS.some(trigger => lower.includes(trigger)) || HOMOGLYPH_REGEX.test(text)) {
 		logger.info(`[ПРЯМОЙ ПИНГ] ${username} упомянул Крапрала → отвечаем`);
 		return true;
 	}
@@ -629,25 +658,33 @@ bot.start(ctx => ctx.reply('Крапрал на посту. Пятая точк�
 
 // Обработка входящего текста (используется для текстовых сообщений)
 // Добавляем сообщение в очередь (debounce)
-function enqueueMessage(ctx: any, text: string, username: string, messageId: number, images?: string[]) {
-	accumulatedMessages.push({
-		user: username,
-		text: text,
-		messageId: messageId,
-		timestamp: Date.now(),
-		ctx: ctx,
-		images: images
+// Promise resolvers for the current batch to keep requests alive
+let batchResolvers: ((value: void | PromiseLike<void>) => void)[] = [];
+
+// Обработка входящего текста (используется для текстовых сообщений)
+// Добавляем сообщение в очередь (debounce)
+function enqueueMessage(ctx: any, text: string, username: string, messageId: number, images?: string[]): Promise<void> {
+	return new Promise((resolve) => {
+		accumulatedMessages.push({
+			user: username,
+			text: text,
+			messageId: messageId,
+			timestamp: Date.now(),
+			ctx: ctx,
+			images: images
+		});
+		batchResolvers.push(resolve);
+
+		logger.info(`[DEBOUNCE] Message buffered from ${username}. Queue size: ${accumulatedMessages.length}`);
+
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+		}
+
+		debounceTimer = setTimeout(async () => {
+			await processAccumulatedMessages();
+		}, DEBOUNCE_DELAY);
 	});
-
-	logger.info(`[DEBOUNCE] Message buffered from ${username}. Queue size: ${accumulatedMessages.length}`);
-
-	if (debounceTimer) {
-		clearTimeout(debounceTimer);
-	}
-
-	debounceTimer = setTimeout(async () => {
-		await processAccumulatedMessages();
-	}, DEBOUNCE_DELAY);
 }
 
 // Обработка входящего текста (используется для текстовых сообщений)
@@ -659,7 +696,10 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	}
 	processedMessageIds.add(messageId);
 
-	enqueueMessage(ctx, text, username, messageId);
+	processedMessageIds.add(messageId);
+
+	// Add await here to hold connection
+	await enqueueMessage(ctx, text, username, messageId);
 }
 
 // Обработка фото
@@ -685,7 +725,9 @@ async function handleIncomingPhoto(ctx: any) {
 		const dataUrl = `data:image/jpeg;base64,${base64Image}`;
 
 		logger.info(`[PHOTO] Received photo from ${username}`);
-		enqueueMessage(ctx, caption, username, messageId, [dataUrl]);
+		logger.info(`[PHOTO] Received photo from ${username}`);
+		// Add await here
+		await enqueueMessage(ctx, caption, username, messageId, [dataUrl]);
 	} catch (error) {
 		logger.error({ error }, `Failed to process photo from ${username}`);
 		await safeReply(ctx, 'Товарищ боец, фото потеряно в тумане войны. Попробуйте еще раз.');
@@ -788,171 +830,211 @@ async function processAccumulatedMessages() {
 	let shouldSpeak = false;
 	let triggerReason = '';
 
-	// Check 1: Direct triggers in ANY message
-	const combinedText = batch.map(b => b.text).join(' . ');
-	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
-	if (KRAPRAL_TRIGGERS.some(trigger => combinedText.toLowerCase().includes(trigger))) {
-		shouldSpeak = true;
-		triggerReason = 'Direct trigger in batch';
-	}
+	try {
 
-	// Check 2: New User (any in batch) -> Checked via knownUsers against each user? 
-	// The original logic checked knownUsers inside shouldKrapralSpeak. 
-	// We should probably rely on the existing function for consistency but adapt it.
+		// Check 1: Direct triggers in ANY message
+		const combinedText = batch.map(b => b.text).join(' . ');
+		const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
+		if (KRAPRAL_TRIGGERS.some(trigger => combinedText.toLowerCase().includes(trigger))) {
+			shouldSpeak = true;
+			triggerReason = 'Direct trigger in batch';
+		}
 
-	if (!shouldSpeak) {
-		// Iterate and check standard logic for each
-		for (const msg of batch) {
-			// Note: This calls the ORIGINAL shouldKrapralSpeak which checks history.
-			// Since we just added all items to history, the "history" check inside might be slightly skewed
-			// because "messagesSinceLastResponse" will include the current batch items we just added.
-			// This is actually GOOD: it means larger batches increase the "count" automatically.
-			if (shouldKrapralSpeak(msg.user, msg.text)) {
-				shouldSpeak = true;
-				triggerReason = `Logic for msg from ${msg.user}`;
-				break;
+		// Check 2: New User (any in batch) -> Checked via knownUsers against each user? 
+		// The original logic checked knownUsers inside shouldKrapralSpeak. 
+		// We should probably rely on the existing function for consistency but adapt it.
+
+		if (!shouldSpeak) {
+			// Iterate and check standard logic for each
+			for (const msg of batch) {
+				// Note: This calls the ORIGINAL shouldKrapralSpeak which checks history.
+				// Since we just added all items to history, the "history" check inside might be slightly skewed
+				// because "messagesSinceLastResponse" will include the current batch items we just added.
+				// This is actually GOOD: it means larger batches increase the "count" automatically.
+				if (shouldKrapralSpeak(msg.user, msg.text)) {
+					shouldSpeak = true;
+					triggerReason = `Logic for msg from ${msg.user}`;
+					break;
+				}
 			}
 		}
-	}
 
-	if (!shouldSpeak) {
-		logger.info(`[BATCH SILENCE] Processed ${batch.length} messages, decided not to answer.`);
-		return;
-	}
+		if (!shouldSpeak) {
+			logger.info(`[BATCH SILENCE] Processed ${batch.length} messages, decided not to answer.`);
+			return;
+		}
 
-	logger.info(`[BATCH REPLY] Decided to answer. Reason: ${triggerReason}`);
+		logger.info(`[BATCH REPLY] Decided to answer. Reason: ${triggerReason}`);
 
-	// 3. Generate Response
-	// We need to pass the FULL history (which now includes the batch) to the AI.
+		// 3. Generate Response
+		// We need to pass the FULL history (which now includes the batch) to the AI.
 
-	// Check if we have visual content (images) in the batch
-	const allImages = batch.flatMap(m => m.images || []);
-	let modelToUse = 'gpt-4o'; // Default Primary
-	let apiToUse: 'grok' | 'openai' = 'openai';
+		// Check if we have visual content (images) in the batch
+		const allImages = batch.flatMap(m => m.images || []);
+		let modelToUse = 'gpt-4o'; // Default Primary
+		let apiToUse: 'grok' | 'openai' = 'openai';
 
-	let messagesForAi: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+		let messagesForAi: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
 
-	// --- CONSTRUCT MESSAGES FOR OPENAI (PRIMARY) ---
-	if (allImages.length > 0) {
-		logger.info(`[VISION] Detected ${allImages.length} images in batch -> Forcing OpenAI (gpt-4o)`);
+		// --- CONSTRUCT MESSAGES FOR OPENAI (PRIMARY) ---
+		if (allImages.length > 0) {
+			logger.info(`[VISION] Detected ${allImages.length} images in batch -> Forcing OpenAI (gpt-4o)`);
 
-		// Construct vision-compatible messages
-		messagesForAi = [
-			{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}` }, // Inject profile of first user (or maybe we should mix?) - simplifying to first
-			...history.map(m => ({
-				role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-				content: m.name ? `${m.name}: ${m.content}` : m.content
-			}))
-		];
+			// Construct vision-compatible messages
+			messagesForAi = [
+				{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}\n\n${getSquadRoster()}` }, // Inject profile of first user (or maybe we should mix?) - simplifying to first
+				...history.map(m => ({
+					role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+					content: m.name ? `${m.name}: ${m.content}` : m.content
+				}))
+			];
 
-		// Add the current batch as a single multi-modal user message
-		const textContent = batch.map(m => `${m.user}: ${m.text}`).join('\n');
-		const contentBlock: any[] = [{ type: 'text', text: textContent }];
+			// Add the current batch as a single multi-modal user message
+			const textContent = batch.map(m => `${m.user}: ${m.text}`).join('\n');
+			const contentBlock: any[] = [{ type: 'text', text: textContent }];
 
-		allImages.forEach(img => {
-			contentBlock.push({
-				type: 'image_url',
-				image_url: { url: img, detail: 'low' }
+			allImages.forEach(img => {
+				contentBlock.push({
+					type: 'image_url',
+					image_url: { url: img, detail: 'low' }
+				});
 			});
-		});
 
-		messagesForAi.push({
-			role: 'user',
-			content: contentBlock
-		});
+			messagesForAi.push({
+				role: 'user',
+				content: contentBlock
+			});
 
-	} else {
-		// Standard text-only flow
-		// Standard formatting
-		messagesForAi = [
-			{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}` },
-			...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
-			// Add batch texts
-			...batch.map(m => ({
-				role: 'user' as const,
-				content: `${m.user}: ${m.text}`
-			}))
-		];
-	}
+		} else {
+			// Standard text-only flow
+			// Standard formatting
+			messagesForAi = [
+				{ role: 'system', content: `${IDENTITY}\n\n${getUserProfile(batch[0].user)}\n\n${getSquadRoster()}` },
+				...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
+				// Add batch texts
+				...batch.map(m => ({
+					role: 'user' as const,
+					content: `${m.user}: ${m.text}`
+				}))
+			];
+		}
 
-	// --- EXECUTE STRATEGY: OPENAI PRIMARY, GROK FALLBACK ---
-	let resultText = '';
-	let success = false;
+		// --- EXECUTE STRATEGY: GROK PRIMARY, OPENAI FALLBACK ---
+		let resultText = '';
+		let success = false;
 
-	// 1. Try OpenAI
-	try {
-		resultText = await getKrapralResponseFromOpenAI('', lastMsg.user, messagesForAi);
-		success = true;
-		apiToUse = 'openai';
-	} catch (openaiError: any) {
-		logger.error({ error: openaiError }, 'OpenAI Strategy failed. Attempting Fallback to Grok.');
-
-		// 2. Fallback to Grok (only if no images because Grok integration here is text-only?)
-		// Assuming current Grok implementation is text-only or we don't want to risk complex request
-		if (allImages.length === 0) {
+		// 0. CHECK FOR VISION (Grok is Text-Only implementation here)
+		if (allImages.length > 0) {
+			logger.info('Request contains images. Forcing OpenAI (Vision).');
 			try {
+				resultText = await getKrapralResponseFromOpenAI('', lastMsg.user, messagesForAi);
+				success = true;
+				apiToUse = 'openai';
+			} catch (visionError: any) {
+				logger.error({ error: visionError }, 'OpenAI Vision failed.');
+			}
+		} else {
+			// 1. Try Grok (Primary for Text)
+			try {
+				// Construct full text context for Grok
 				const fullText = batch.map(m => `${m.user}: ${m.text}`).join('\n---\n');
-				// Use profile context in Grok too (wrapper handles it if we pass simple text? No, wrapper needs override or we trust wrapper)
-				// Actually getKrapralResponseFromGrok constructs its own messages. We should just pass the text.
-				// WE WAIT: getKrapralResponseFromGrok takes (text, username). It injects context internally.
 				resultText = await getKrapralResponseFromGrok(fullText, batch[0].user);
 				success = true;
 				apiToUse = 'grok';
-				logger.info('Fallback to Grok successful.');
 			} catch (grokError: any) {
-				logger.error({ error: grokError }, 'Grok Fallback also failed.');
+				logger.error({ error: grokError }, 'Grok (Primary) failed. Attempting Fallback to OpenAI.');
+
+				// 2. Fallback to OpenAI
+				try {
+					resultText = await getKrapralResponseFromOpenAI('', lastMsg.user, messagesForAi);
+					success = true;
+					apiToUse = 'openai';
+					logger.info('Fallback to OpenAI successful.');
+				} catch (openaiError: any) {
+					logger.error({ error: openaiError }, 'OpenAI Fallback also failed.');
+				}
 			}
+		}
+
+		if (!success) {
+			await safeReply(ctx, 'Связь потеряна. Оба канала (OpenAI/Grok) лежат. Крапрал уходит в бункер.');
+			return;
+		}
+
+		const apiName = apiToUse === 'openai' ? `OpenAI (${modelToUse})` : 'Grok (Fallback)';
+		logger.info(`Крапрал отвечает (Batch) | API: ${apiName}`);
+
+		// Parse [REACTION:Emoji] tag
+		const reactionMatch = resultText.match(/\[REACTION:\s*(.+?)\s*\]/);
+
+		// Parse [POLL:Question|Opt1|Opt2] tag
+		const pollMatch = resultText.match(/\[POLL:(.+?)\]/);
+
+		let finalResponse = resultText;
+		// STRIP REPEATED NAMES (Common LLM artifact)
+		// E.g. "Krapral: Hello" -> "Hello"
+		finalResponse = finalResponse.replace(/^(@?Krapral|@?Крапрал)(\s?2\.0)?:\s*/i, '');
+
+		if (reactionMatch) {
+			const emoji = reactionMatch[1].trim(); // Trim to be safe
+			// Remove tag from text
+			finalResponse = finalResponse.replace(/\[REACTION:\s*.+?\s*\]\s*/g, '').trim();
+
+			if (ctx) {
+				await applyReaction(ctx, emoji);
+			}
+		}
+
+		if (pollMatch) {
+			// Format: [POLL:Question|Option 1|Option 2]
+			const content = pollMatch[1];
+			const parts = content.split('|').map(s => s.trim());
+			if (parts.length >= 3) {
+				const question = parts[0];
+				const options = parts.slice(1);
+
+				// Remove tag
+				finalResponse = finalResponse.replace(/\[POLL:.+?\]\s*/g, '').trim();
+
+				if (ctx) {
+					// We send poll separately via helper
+					await sendPoll(ctx, question, options);
+				}
+			}
+		}
+
+		if (finalResponse) {
+			logger.info(`[REPLY] Attempting to send text response: "${finalResponse.substring(0, 50)}..."`);
+			await safeReply(ctx, finalResponse);
+			logger.info(`[REPLY] Sent successfully.`);
 		} else {
-			logger.warn('Cannot fallback to Grok because request contains images (Vision).');
+			logger.info('[BATCH] Response was only tags (reaction/poll), skipping text reply.');
+		}
+
+		// 4. Save Assistant Response
+		if (finalResponse) {
+			history.push({
+				role: 'assistant',
+				name: 'Krapral',
+				content: finalResponse,
+				timestamp: Date.now()
+			});
+			saveHistory();
+		}
+
+	} finally {
+		// RESOLVE ALL PROMISES to release HTTP requests
+		if (batchResolvers.length > 0) {
+			logger.info(`[BATCH] Releasing ${batchResolvers.length} waiting requests (finally block).`);
+			batchResolvers.forEach(resolve => resolve());
+			batchResolvers = [];
 		}
 	}
-
-	if (!success) {
-		// If both failed
-		await safeReply(ctx, 'Связь потеряна. Оба канала (OpenAI/Grok) лежат. Крапрал уходит в бункер.');
-		return;
-	}
-
-	const apiName = apiToUse === 'openai' ? `OpenAI (${modelToUse})` : 'Grok (Fallback)';
-	logger.info(`Крапрал отвечает (Batch) | API: ${apiName}`);
-
-	// Parse [REACTION:Emoji] tag
-	const reactionMatch = resultText.match(/^\[REACTION:(.+?)\]/);
-	let finalResponse = resultText;
-
-	if (reactionMatch) {
-		const emoji = reactionMatch[1];
-		// Remove tag from text
-		finalResponse = resultText.replace(/^\[REACTION:.+?\]\s*/, '').trim();
-
-		// Apply reaction using context of the LAST message in batch (most relevant)
-		if (ctx) {
-			// Note: reaction logic is best effort.
-			// We use 'await' but don't block main reply if it fails?
-			// Actually, await is fine.
-			await applyReaction(ctx, emoji);
-		}
-	}
-
-	if (finalResponse) {
-		await safeReply(ctx, finalResponse);
-	} else {
-		logger.info('[BATCH] Response was only a reaction (empty text after strip), skipping text reply.');
-	}
-
-	// 4. Save Assistant Response
-	history.push({
-		role: 'assistant',
-		name: '@Krapral',
-		content: resultText, // Save ORIGINAL with tag so context knows we reacted
-		timestamp: Date.now()
-	});
-	saveHistory();
 }
 
 // Обработка транскрибированного текста (для голосовых) + теперь и для Visual Context
 async function handleIncomingTextAfterTranscription(ctx: any, text: string, username: string, messageId: number, images?: string[]) {
-	enqueueMessage(ctx, text, username, messageId, images);
+	await enqueueMessage(ctx, text, username, messageId, images);
 }
 
 // Основной обработчик текстовых сообщений
@@ -965,6 +1047,7 @@ bot.on('text', async (ctx) => {
 	const text = msg.text.trim();
 
 	try {
+		logger.info(`[TEXT_HANDLER] Received text from ${username}: "${text}" (ID: ${messageId})`);
 		await handleIncomingText(ctx, text, username, messageId);
 	} catch (e: any) {
 		logger.error({ error: e }, 'Error in text handler');
