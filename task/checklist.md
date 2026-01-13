@@ -1,29 +1,12 @@
-# Project Checklist
+# Bot Update Checklist
 
-- [x] Package A started
-- [x] Package A completed
-- [x] Package B started
-- [x] Package B completed
-- [x] Package C started
-- [x] Package C completed
-- [x] Package D started
-- [x] Package D completed
-- [x] Package E started
-- [x] Package E completed
-- [ ] Regression tests passed
-- [ ] Persona approved
-
-## Execution Rules
-
-- Work one package at a time
-- Stop after each package for review and approval
-- No personality expansion before history analysis
-- No silent changes to core identity
-
-## Definition of Done
-
-- Bot replies are context-aware, non-repetitive, and human-like
-- Audio and video inputs are handled gracefully
-- Errors are transparent and debuggable
-- Personality feels broader without losing consistency
-- Progress is fully traceable via checklist
+- [x] Check /task/result.json contents <!-- id: 0 -->
+- [x] Update Bot to use latest OpenAI model (v5.2) <!-- id: 1 -->
+- [x] Rearrange users config structure to match prompt requirements <!-- id: 2 -->
+    - [x] Update `users.json` (consolidate relationships, rename triggers to taboos, ensure tone is top-level)
+    - [x] Update interfaces in `src/bot.ts`
+- [x] Reorganize/Improve Bot "Brain" (System Prompt) <!-- id: 3 -->
+    - [x] Update `identity.txt` with the new Core Identity and Style Rules
+    - [x] Implement `CHAT_SUMMARY` (rolling summary) logic
+    - [x] Implement `INTENT` selection logic
+    - [x] Update `getKrapralResponseFromOpenAI` to construct the new Prompt format
