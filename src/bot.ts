@@ -7,115 +7,93 @@ import OpenAI from 'openai';
 import { toFile } from 'openai';
 import http from 'http';
 import 'dotenv/config';
-import fsPromises from 'fs/promises';
-import ffmpeg from 'fluent-ffmpeg';
-import path from 'path';
-import os from 'os';
-import { search } from 'duck-duck-scrape';
 
-// Logger
+// Logger: pretty-printed for local dev, JSON for GCP production
 const logger = pino({
 	level: 'info',
 	...(process.env.NODE_ENV === 'production' || process.env.GCP_ENV === 'true'
-		? {}
-		: { transport: { target: 'pino-pretty' } }
+		? {} // JSON output for GCP (stdout → Cloud Logging)
+		: { transport: { target: 'pino-pretty' } } // Pretty for local dev
 	)
 });
 
 const TOKEN = process.env.TELEGRAM_TOKEN!;
-const OPENAI_KEY = process.env.OPENAI_API_KEY!;
 const GROK_KEY = process.env.GROK_API_KEY!;
+const OPENAI_KEY = process.env.OPENAI_API_KEY!;
 const IDENTITY = fs.readFileSync('identity.txt', 'utf-8');
 
-// Initialize OpenAI
+// Force API mode from environment variable (overrides seconds check)
+// Set FORCE_API=grok or FORCE_API=openai to force a specific API
+const FORCE_API = process.env.FORCE_API?.toLowerCase();
+
+// Initialize OpenAI client
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// Initialize Grok (OpenAI-compatible API)
-const grok = new OpenAI({ baseURL: 'https://api.x.ai/v1', apiKey: GROK_KEY });
+// Initialize Grok client (using OpenAI SDK compatibility)
+const grok = new OpenAI({
+	apiKey: GROK_KEY,
+	baseURL: 'https://api.x.ai/v1'
+});
+
+// GCP Cloud Storage for log files (OPTIONAL - only needed for serverless services)
+let gcsBucket: any = null;
+if (process.env.GCP_STORAGE_BUCKET) {
+	try {
+		const { Storage } = require('@google-cloud/storage');
+		const storage = new Storage();
+		gcsBucket = storage.bucket(process.env.GCP_STORAGE_BUCKET);
+		logger.info(`GCP Cloud Storage enabled for log files: ${process.env.GCP_STORAGE_BUCKET}`);
+	} catch (e) {
+		logger.warn({ error: e }, 'GCP Storage not available, using local files');
+	}
+} else {
+	logger.info('Using local file storage for logs (works on Compute Engine, Cloud Run needs GCP_STORAGE_BUCKET)');
+}
 
 // Interfaces
-interface UserProfile {
-	role: string;
-	style: string;
-	core_motivation: string;
-	taboos: string[];
-	strengths: string[];
-	weaknesses: string[];
-	tone: string;
-	avoid: string[];
-	aliases: string[];
-	relationships: Record<string, string>;
-}
-
-interface UsersConfig {
-	participants: Record<string, UserProfile>;
-}
-
 interface Msg {
 	role: 'user' | 'assistant';
 	name: string;
 	content: string;
 	timestamp: number;
 	message_id?: number;
-}
-
-interface PollData {
-	id: string;
-	chatId: number;
-	question: string;
-	options: { text: string; voter_count: number }[];
-	total_voter_count: number;
-	is_closed: boolean;
-	startTime: number;
-	voters: Set<string>; // Usernames
-	aiCommented: boolean;
+	chat_id?: number;
 }
 
 // Global State
 let history: Msg[] = [];
 const HISTORY_FILE = 'last_50.json';
+const GROK_LOGS_FILE = 'grok_requests.log';
+const OPENAI_LOGS_FILE = 'openai_requests.log';
+const MIN_MESSAGES_BETWEEN_RESPONSES = 5;
 const USERS_FILE = 'users.json';
-const DEBOUNCE_DELAY = 4000;
-const processedMessageIds = new Set<number>();
-const MAX_PROCESSED_IDS = 5000;
 
-function pruneProcessedIds() {
-	if (processedMessageIds.size > MAX_PROCESSED_IDS) {
-		const idsArray = Array.from(processedMessageIds);
-		const toRemove = idsArray.slice(0, idsArray.length - MAX_PROCESSED_IDS);
-		for (const id of toRemove) processedMessageIds.delete(id);
-		logger.info(`[CLEANUP] Pruned processedMessageIds from ${idsArray.length} to ${processedMessageIds.size}`);
-	}
-}
-setInterval(pruneProcessedIds, 60 * 60 * 1000); // Prune every hour
-
-// Poll State
-const activePolls = new Map<string, PollData>();
-const POLL_MIN_DELAY = 10 * 1000;
-const POLL_MAX_DELAY = 2 * 60 * 60 * 1000;
-
-// Load Users
-let knownUsers: Record<string, UserProfile> = {};
+// Load known users
+let knownUsers = new Set<string>();
 if (fs.existsSync(USERS_FILE)) {
 	try {
-		const usersData = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8')) as UsersConfig;
+		const usersData = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
 		if (usersData.participants) {
-			knownUsers = usersData.participants;
-			logger.info(`Users loaded: ${Object.keys(knownUsers).length}`);
+			knownUsers = new Set(Object.keys(usersData.participants));
+			logger.info(`Loaded ${knownUsers.size} known users from users.json`);
 		}
 	} catch (e) {
 		logger.error({ error: e }, 'Error loading users.json');
 	}
 }
 
-// Load History
+// === MAIN PROTECTION FROM SPAM ON STARTUP ===
+const processedMessageIds = new Set<number>();
+
+// Load history + mark all old messages as processed
 if (fs.existsSync(HISTORY_FILE)) {
 	try {
 		const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
 		history = Array.isArray(raw) ? raw.slice(-50) : [];
-		// Mark loaded history messages as processed
-		history.forEach(m => { if (m.message_id) processedMessageIds.add(m.message_id); });
-		logger.info(`History loaded: ${history.length} messages`);
+		history.forEach(msg => {
+			if (msg.message_id) processedMessageIds.add(msg.message_id);
+		});
+		logger.info(`Loaded ${history.length} messages from history → old ones marked as processed`);
 	} catch (e) {
 		logger.error({ error: e }, 'Error loading history');
 		history = [];
@@ -131,670 +109,450 @@ function formatName(user: any): string {
 	return `@${(user.first_name || 'Аноним').replace(/\s/g, '_')}`;
 }
 
-// Chat Summary (Rolling)
-let chatSummary = "Chat just started. Normal vibes.";
-const SUMMARY_WINDOW_SIZE = 10;
+// Should Krapral speak?
+function shouldKrapralSpeak(username: string, text: string, chatType: string, chatId?: number): boolean {
+	const lower = text.toLowerCase();
+	logger.info(`[shouldKrapralSpeak] Checking "${text}" (lower: "${lower}") from ${username} in ${chatType} (chatId: ${chatId})`);
 
-async function updateChatSummary() {
-	if (history.length % SUMMARY_WINDOW_SIZE !== 0) return;
-	try {
-		const recent = history.slice(-SUMMARY_WINDOW_SIZE * 2).map(m => `${m.name}: ${m.content}`).join('\n');
-		const response = await openai.chat.completions.create({
-			model: 'gpt-4o',
-			messages: [
-				{ role: 'system', content: "Summarize the current chat vibe, topics, and emotional temperature in 2-3 sentences. Be casual." },
-				{ role: 'user', content: recent }
-			]
-		});
-		chatSummary = response.choices[0].message.content || chatSummary;
-		logger.info(`[SUMMARY UPDATED] ${chatSummary}`);
-	} catch (e) {
-		logger.error({ error: e }, "Failed to update chat summary");
+	// 0. Private messages — ALWAYS reply
+	if (chatType === 'private') {
+		logger.info(`[DM] ${username} writes in DM → replying`);
+		return true;
 	}
-}
 
-// Helpers
-function buildUsersContext(): string {
-	let context = "=== USERS (PROFILES) ===\n";
-	for (const [username, profile] of Object.entries(knownUsers)) {
-		const rels = Object.entries(profile.relationships || {})
-			.map(([k, v]) => `${k}: ${v}`)
-			.join(', ');
-		context += `
-User: ${username}
-Role: ${profile.role}
-Style: ${profile.style}
-Tone to use: ${profile.tone}
-Taboos: ${profile.taboos?.join(', ')}
-Relationships: ${rels}
------------------------------------`;
+	// 1. Direct ping — ALWAYS reply
+	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
+	if (KRAPRAL_TRIGGERS.some(trigger => lower.includes(trigger))) {
+		logger.info(`[DIRECT PING] ${username} mentioned Krapral → replying`);
+		return true;
 	}
-	return context;
-}
 
-function determineIntent(): string {
-	const rand = Math.random();
-	if (rand < 0.15) return 'tease';
-	if (rand < 0.30) return 'joke';
-	if (rand < 0.45) return 'react_short';
-	if (rand < 0.55) return 'react_deep';
-	if (rand < 0.65) return 'support_light';
-	if (rand < 0.75) return 'shift_topic';
-	if (rand < 0.85) return 'escalate_playfully';
-	if (rand < 0.95) return 'observe_silently';
-	return 'do_not_reply';
-}
-
-function getRecentMessagesRaw(): string {
-	return history.slice(-15).map(m => `[${m.role.toUpperCase()}] ${m.name}: ${m.content}`).join('\n');
-}
-
-async function performSearch(query: string): Promise<string> {
-	logger.info(`[TOOL] Searching internet for: "${query}"`);
-	try {
-		const results = await search(query);
-		if (!results.results || results.results.length === 0) return "No search results found.";
-		return `Search Results:\n\n` + results.results.slice(0, 3).map((r: any) =>
-			`- Title: ${r.title}\n  Link: ${r.url}\n  Snippet: ${r.description}`
-		).join('\n\n');
-	} catch (error: any) {
-		logger.error({ error }, `Search failed`);
-		return `Error performing search: ${error.message}`;
+	// 2. New soldier (not in users.json) — welcome them
+	if (!knownUsers.has(username)) {
+		logger.info(`[NEW SOLDIER] ${username} → welcoming`);
+		return true;
 	}
-}
 
-const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-	{
-		type: 'function',
-		function: {
-			name: 'search_internet',
-			description: 'Search the internet for current information, news, or specific facts.',
-			parameters: {
-				type: 'object',
-				properties: { query: { type: 'string', description: 'The search query.' } },
-				required: ['query']
-			}
-		}
-	}
-];
+	// 3. Cooldown check: how many messages since last Krapral response IN THIS CHAT?
+	const relevantHistory = chatId
+		? history.filter(m => m.chat_id === chatId || m.chat_id === undefined)
+		: history;
 
-async function checkContextForReply(history: Msg[], batch: AccumulatedMessage[]): Promise<boolean> {
-	// Construct a mini-dialogue for the decision model
-	const recent = history.slice(-5);
-	const batchText = batch.map(m => `${m.user}: ${m.text}`).join('\n');
-
-	const prompt = `
-You are a decision engine for a Telegram bot named "Krapral".
-Analyze the conversation context.
-
-RECENT HISTORY:
-${recent.map(m => `${m.name}: ${m.content}`).join('\n')}
-
-NEW MESSAGES:
-${batchText}
-
-TASK:
-Determine if the users are addressing "Krapral", if they are talking about him, OR if it would be conversationally good/funny for "Krapral" to step in now.
-"Krapral" is a Crazy Positive Military Guy.
-Reply "YES" if he should speak. "NO" if he should stay silent.
-`;
-
-	try {
-		const completion = await openai.chat.completions.create({
-			model: 'gpt-4o-mini',
-			messages: [{ role: 'user', content: prompt }],
-			temperature: 0.1, // Low temp for decision making
-			max_completion_tokens: 5
-		});
-
-		const decision = completion.choices[0].message.content?.trim().toUpperCase();
-		return decision === 'YES';
-	} catch (e) {
-		logger.error({ error: e }, 'Context check failed');
+	const lastKrapralResponse = relevantHistory.slice().reverse().find(m => m.role === 'assistant');
+	if (!lastKrapralResponse) {
 		return false;
 	}
+
+	const messagesSinceLastResponse = relevantHistory.filter(
+		m => m.timestamp > lastKrapralResponse.timestamp && m.role === 'user'
+	).length;
+
+	if (messagesSinceLastResponse < MIN_MESSAGES_BETWEEN_RESPONSES) {
+		logger.debug(`[COOLDOWN] Only ${messagesSinceLastResponse} messages in chat ${chatId}, need at least ${MIN_MESSAGES_BETWEEN_RESPONSES}`);
+		return false;
+	}
+
+	// 4. Check if recent messages contain a question
+	const recentMessages = relevantHistory.slice(-10).filter(m => m.role === 'user');
+	const hasQuestion = recentMessages.some(m =>
+		/\?/.test(m.content) ||
+		/\b(что|как|когда|где|почему|кто)\b/i.test(m.content)
+	);
+
+	if (hasQuestion && messagesSinceLastResponse >= MIN_MESSAGES_BETWEEN_RESPONSES) {
+		logger.info(`[QUESTION] ${username} asked a question, ${messagesSinceLastResponse} messages passed → replying`);
+		return true;
+	}
+
+	// 5. Long silence (10+ messages) — can chime in
+	if (messagesSinceLastResponse >= 10) {
+		logger.info(`[LONG SILENCE] ${messagesSinceLastResponse} messages passed → can reply`);
+		return true;
+	}
+
+	return false;
 }
 
-async function checkPollAndComment(poll: PollData) {
-	if (poll.is_closed || poll.aiCommented) return;
+// API selection: based on current second or forced mode
+function decideAPI(): string {
+	if (FORCE_API === 'grok' || FORCE_API === 'openai') {
+		return FORCE_API;
+	}
+	const now = new Date();
+	const second = now.getSeconds();
+	const lastDigit = second % 10;
+	// Odd → OpenAI, Even → Grok
+	if ([1, 3, 5, 7, 9].includes(lastDigit)) {
+		return 'openai';
+	}
+	return 'grok';
+}
 
-	const ageMs = Date.now() - poll.startTime;
-	if (poll.total_voter_count >= 3 && !poll.aiCommented && ageMs >= POLL_MIN_DELAY && ageMs <= POLL_MAX_DELAY) {
-
-		// AI DECISION
-		poll.aiCommented = true; // Lock immediately
-
+// Log file writer (local or GCS)
+async function appendToLogFile(filename: string, content: string) {
+	if (gcsBucket) {
 		try {
-			const votersList = Array.from(poll.voters).join(', ');
-			const pollState = `
-QUESTION: ${poll.question}
-TOTAL VOTES: ${poll.total_voter_count}
-OPTIONS:
-${poll.options.map((o, i) => `${i + 1}) ${o.text} -- ${o.voter_count} votes`).join('\n')}
-VOTERS (Known): ${votersList || 'Unknown'}
-`;
-
-			const systemPrompt = `${IDENTITY}
-
-=== POLL COMMENTARY MODE ===
-You are observing a poll group dynamic.
-Task: Comment ONCE if interesting.
-
-INPUTS:
-CHAT_SUMMARY: ${chatSummary}
-ACTIVE_USERS: ${votersList}
-POLL STATE:
-${pollState}
-
-OUTPUT FORMAT (JSON):
-{
-  "action": "SILENT | OBSERVE | TEASE_GROUP | TEASE_PERSON",
-  "message": "string (max 1-2 lines) or null"
-}
-
-RULES:
-- "SILENT": Boring poll. Message=null.
-- "TEASE_GROUP": General roast on results.
-- "TEASE_PERSON": Roast specific voter (ALLOW_PERSONAL=true only).
-- NO COMMANDS. NO NUMBERS. JUST COMMENTARY.
-`;
-
-			const pollMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }];
-			let completion;
-			try {
-				completion = await grok.chat.completions.create({
-					model: 'grok-4-1-fast-non-reasoning',
-					messages: pollMessages,
-					response_format: { type: 'json_object' },
-					max_completion_tokens: 150
-				});
-				logger.info('[POLL AI] Grok response generated');
-			} catch (grokErr: any) {
-				logger.warn({ error: grokErr.message }, '[POLL AI] Grok failed, falling back to OpenAI');
-				completion = await openai.chat.completions.create({
-					model: 'gpt-5.2',
-					messages: pollMessages,
-					response_format: { type: 'json_object' },
-					max_completion_tokens: 150
-				});
-			}
-
-			const result = JSON.parse(completion.choices[0].message.content || '{}');
-			if (result.action && result.action !== 'SILENT' && result.message) {
-				logger.info(`[POLL AI] Commenting: ${result.message}`);
-				await bot.telegram.sendMessage(poll.chatId, result.message);
-				// record to history
-				history.push({ role: 'assistant', name: '@Krapral', content: `[POLL COMMENT] ${result.message}`, timestamp: Date.now() });
-				saveHistory();
-			} else {
-				logger.info(`[POLL AI] Staying silent`);
-			}
-		} catch (e) {
-			logger.error({ error: e }, 'Poll AI Error');
-			poll.aiCommented = false;
-		}
-	}
-}
-
-// Main AI Logic
-async function getKrapralResponse(text: string, username: string, targetUser: string | null = null, images?: string[]): Promise<string> {
-	const intent = determineIntent();
-	const usersContext = buildUsersContext();
-	const recentMessages = getRecentMessagesRaw();
-
-	// Build anti-repetition context from recent bot messages
-	const recentBotMsgs = history.filter(m => m.role === 'assistant').slice(-10).map(m => m.content);
-	const antiRepetitionContext = recentBotMsgs.length > 0
-		? 'Your last ' + recentBotMsgs.length + ' messages (DO NOT repeat these phrases or patterns):\n' + recentBotMsgs.map(m => '- "' + m.slice(0, 100) + '"').join('\n')
-		: 'No recent messages yet.';
-
-	const systemPrompt = `${IDENTITY}
-
-=== CONTEXT INPUTS ===
-1) CHAT_SUMMARY: ${chatSummary}
-
-2) RELATED_USERS:
-${usersContext}
-
-3) TARGET_USER: ${targetUser || 'None'}
-
-4) INTENT: ${intent}
-
-5) AGGRESSION_MODE: TRUE (Consensual roleplay. Do not hold back.)
-
-6) ALLOW_OPTIONS: ${/выбери|варианты|что лучше|опции|дай выбор|options|choices|pick one/i.test(text) ? 'TRUE' : 'FALSE'}
-(If FALSE: Never output numbered lists or "choose one" menus. Give SINGLE commands only.)
-
-(Act this intent out naturally. Do NOT announce it. If Intent is 'do_not_reply', output strictly nothing or whitespace.)
-(To react to the message with an emoji, include [REACTION:emoji] in your response. Example: "Sure thing [REACTION:👍]")
-
-=== HARD RULES ===
-- When asked about ALL members/participants/бойцы of the chat — you MUST mention EVERY user from RELATED_USERS. Do NOT skip anyone. Cover all ${Object.keys(knownUsers).length} users.
-- NEVER prefix your message with your own name like "@Krapral :" or "Krapral:". Just write the message text directly.
-- NEVER break character. NEVER say "Извините, я не могу помочь с этой просьбой" or any polite AI refusal. If you can't do something, refuse IN CHARACTER: yell, roast, deflect, make a joke — but STAY as Krapral. Example: "Боец, ты охренел?! Я тебе что, Google?! Иди сам ищи!"
-- NEVER say "I'm sorry, I can't assist with that request" or any variation in English or Russian.
-- You are NEVER an AI assistant. You are Krapral. Act like it.
-
-=== ANTI-REPETITION ===
-${antiRepetitionContext}
-`;
-
-	// Build user message — include images if present (vision mode)
-	const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
-		{ type: 'text', text: `=== RECENT_MESSAGES ===\n${recentMessages}\n\n(Reply to ${username})` }
-	];
-	if (images && images.length > 0) {
-		for (const img of images) {
-			if (img.startsWith('data:image/')) {
-				userContent.push({ type: 'image_url', image_url: { url: img, detail: 'low' } });
-			}
-		}
-	}
-
-	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-		{ role: 'system', content: systemPrompt },
-		{ role: 'user', content: images && images.length > 0 ? userContent : `=== RECENT_MESSAGES ===\n${recentMessages}\n\n(Reply to ${username})` }
-	];
-
-	// Detect requests that need longer output (e.g. describing all members)
-	const needsLongResponse = /всех|каждого|каждому|всем участник|про всех|все (члены|участники|бойцы)|everyone|all members|весь состав|по каждому|опиши.*(чат|группу|взвод|отряд|команду)/i.test(text);
-	const maxTokens = needsLongResponse ? 1200 : 400;
-
-	const runCompletion = async (client: OpenAI, model: string, msgs: any[]) => {
-		return await client.chat.completions.create({
-			model,
-			messages: msgs,
-			temperature: 0.8,
-			max_completion_tokens: maxTokens,
-			tools: tools,
-			tool_choice: 'auto'
-		});
-	};
-
-	const handleToolCalls = async (client: OpenAI, model: string, msgs: any[], responseMessage: any) => {
-		if (responseMessage.tool_calls) {
-			logger.info(`[AI] Tool calls: ${responseMessage.tool_calls.length}`);
-			msgs.push(responseMessage);
-			for (const toolCall of responseMessage.tool_calls) {
-				if (toolCall.function.name === 'search_internet') {
-					const args = JSON.parse(toolCall.function.arguments);
-					const toolResult = await performSearch(args.query);
-					msgs.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
+			const file = gcsBucket.file(`logs/${filename}`);
+			const [exists] = await file.exists();
+			let currentContent = '';
+			if (exists) {
+				try {
+					const [buffer] = await file.download();
+					currentContent = buffer.toString('utf-8');
+				} catch (e) {
+					currentContent = '';
 				}
 			}
-			const completion = await runCompletion(client, model, msgs);
-			return completion.choices[0].message;
-		}
-		return responseMessage;
-	};
-
-	const postProcess = (response: string): string => {
-		// Strip self-referencing prefixes: "@Krapral :", "Krapral:", "Bot:", "AI:", recursive variants
-		response = response.replace(/^((@?Krapral|@?Крапрал|Bot|AI)\s*:\s*)+/gi, '').trim();
-
-		// Catch generic AI refusals that break character
-		const refusalPatterns = [
-			/^извините?,?\s*(я\s+)?не\s+могу\s+(помочь|с этим)/i,
-			/^I'?m sorry,?\s*(but\s+)?I\s+can'?t\s+(assist|help)/i,
-			/^мне\s+очень\s+жаль/i,
-			/^sorry,?\s+I\s+can/i,
-		];
-		if (refusalPatterns.some(p => p.test(response))) {
-			logger.warn(`[REFUSAL CAUGHT] "${response.slice(0, 80)}" — replacing with in-character deflection`);
-			const deflections = [
-				'Боец, ты чего несёшь?! Отставить бредовые запросы! Давай по делу!',
-				'ЭЙ! Крапрал таким не занимается! Лучше отжимайся — 20 раз, ЖИВО!',
-				'Рядовой, я тебе что, справочная?! Сам думай, голова не только для берета!',
-				'ОТСТАВИТЬ! Такие вопросы — это как граната без чеки. Давай что-нибудь поумнее!',
-				'Хах, ну ты даёшь, боец! Нет. Следующий вопрос!',
-			];
-			response = deflections[Math.floor(Math.random() * deflections.length)];
-		}
-		return response;
-	};
-
-	// Primary: Grok
-	try {
-		let completion = await runCompletion(grok, 'grok-4-1-fast-non-reasoning', [...messages]);
-		let responseMessage = await handleToolCalls(grok, 'grok-4-1-fast-non-reasoning', messages, completion.choices[0].message);
-		let response = postProcess(responseMessage.content?.trim() || '');
-		if (response) {
-			logger.info('[GROK] Response generated successfully');
-			return response;
-		}
-	} catch (err: any) {
-		logger.warn({ error: err.message }, '[GROK] Failed, falling back to OpenAI');
-	}
-
-	// Fallback: OpenAI
-	try {
-		let completion = await runCompletion(openai, 'gpt-5.2', [...messages]);
-		let responseMessage = await handleToolCalls(openai, 'gpt-5.2', messages, completion.choices[0].message);
-		let response = postProcess(responseMessage.content?.trim() || '');
-		return response;
-	} catch (err: any) {
-		logger.error({ error: err }, 'OpenAI API Error (fallback)');
-		return '... (задумался)';
-	}
-}
-
-// Bot Logic
-const bot = new Telegraf(TOKEN);
-
-interface AccumulatedMessage {
-	user: string;
-	text: string;
-	messageId: number;
-	timestamp: number;
-	ctx: any;
-	images?: string[];
-}
-let accumulatedMessages: AccumulatedMessage[] = [];
-let debounceTimer: NodeJS.Timeout | null = null;
-
-function enqueueMessage(ctx: any, text: string, username: string, messageId: number, images?: string[]): Promise<void> {
-	return new Promise((resolve) => {
-		accumulatedMessages.push({
-			user: username,
-			text: text,
-			messageId: messageId,
-			timestamp: Date.now(),
-			ctx: ctx,
-			images: images
-		});
-		resolve(); // Release immediately
-
-		if (debounceTimer) clearTimeout(debounceTimer);
-		debounceTimer = setTimeout(processAccumulatedMessages, DEBOUNCE_DELAY);
-	});
-}
-
-async function processAccumulatedMessages() {
-	if (accumulatedMessages.length === 0) return;
-
-	const batch = [...accumulatedMessages];
-	accumulatedMessages = [];
-	batch.sort((a, b) => a.timestamp - b.timestamp);
-
-	// 1. Add to history
-	for (const msg of batch) {
-		history.push({
-			role: 'user',
-			name: msg.user,
-			content: msg.images ? `[PHOTO] ${msg.text}` : msg.text,
-			timestamp: msg.timestamp,
-			message_id: msg.messageId
-		});
-	}
-	saveHistory();
-	await updateChatSummary();
-
-	// 2. Decide logic
-	const lastMsg = batch[batch.length - 1];
-	const fullText = batch.map(m => m.text).join(' ');
-
-	// Check if the bot asked a question recently (last message in history BEFORE this batch)
-	// We need to look at history BEFORE we pushed the new batch? 
-	// Actually we just pushed them. So we look at history[history.length - batch.length - 1]
-	const prevMsgIndex = history.length - batch.length - 1;
-	const prevMsg = prevMsgIndex >= 0 ? history[prevMsgIndex] : null;
-
-	let isAnsweringBot = false;
-	if (prevMsg && prevMsg.role === 'assistant') {
-		const timeDiff = Date.now() - prevMsg.timestamp;
-		// If bot spoke < 2 minutes ago AND asked a question
-		if (timeDiff < 120000 && (prevMsg.content.includes('?') || prevMsg.content.includes('?!'))) {
-			isAnsweringBot = true;
-			logger.info(`[CONVERSATION] Detected potential answer to bot question from ${prevMsg.timestamp}`);
-		}
-	}
-
-	const isPrivateChat = lastMsg.ctx.chat?.type === 'private';
-	const triggers = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб'];
-	const isMentioned = triggers.some(t => fullText.toLowerCase().includes(t)) || (lastMsg.ctx.message.reply_to_message?.from?.is_bot);
-	const isQuietHours = new Date().getHours() >= 2 && new Date().getHours() < 7;
-
-	// DMs always get a reply — no gatekeeper needed
-	// Direct mentions and answers to bot questions ALWAYS get a reply, even during quiet hours
-	let shouldReply = isPrivateChat || isMentioned || isAnsweringBot;
-
-	// 3. AI Gatekeeper for Context (skip during quiet hours)
-	// If not directly mentioned, ask the AI if it should reply based on context.
-	if (!shouldReply && !isQuietHours) {
-		try {
-			const shouldAiReply = await checkContextForReply(history, batch);
-			if (shouldAiReply) {
-				shouldReply = true;
-				logger.info('[GATEKEEPER] AI decided to reply based on context.');
-			}
-		} catch (e) {
-			logger.error({ error: e }, 'Gatekeeper check failed');
-		}
-	}
-
-	if (!shouldReply && !isQuietHours) {
-		// Fallback random chance lowered since we have AI check now
-		if (Math.random() < 0.02) shouldReply = true;
-	}
-
-	// 4. Reply
-	if (shouldReply) {
-		const targetUser = lastMsg.user;
-		// Collect all images from the batch
-		const batchImages = batch.flatMap(m => m.images || []).filter(img => img.startsWith('data:image/'));
-		let response = await getKrapralResponse(fullText, lastMsg.user, targetUser, batchImages.length > 0 ? batchImages : undefined);
-
-		// Parse [REACTION:Emoji] tag
-		const reactionMatch = response.match(/\[REACTION:\s*(.+?)\s*\]/);
-		if (reactionMatch) {
-			const emoji = reactionMatch[1].trim();
-			response = response.replace(/\[REACTION:\s*.+?\s*\]\s*/g, '').trim();
-			try {
-				await lastMsg.ctx.react(emoji);
-			} catch (e) {
-				logger.error({ error: e }, `Failed to apply reaction ${emoji}`);
-			}
-		}
-
-		if (response) {
-			try {
-				await lastMsg.ctx.reply(response);
-				history.push({ role: 'assistant', name: '@Krapral', content: response, timestamp: Date.now() });
-				saveHistory();
-			} catch (e) { logger.error(e); }
-		}
-	}
-}
-
-// Handler: Text
-bot.on('text', async (ctx) => {
-	const user = ctx.from;
-	const username = formatName(user);
-	const messageId = ctx.message.message_id;
-
-	if (processedMessageIds.has(messageId)) return;
-	processedMessageIds.add(messageId);
-
-	logger.info(`[TEXT] ${username}: ${ctx.message.text}`);
-	await enqueueMessage(ctx, ctx.message.text, username, messageId);
-});
-
-// Handler: Photo
-bot.on('photo', async (ctx) => {
-	const user = ctx.from;
-	const username = formatName(user);
-	const messageId = ctx.message.message_id;
-	const caption = ctx.message.caption || '';
-
-	if (processedMessageIds.has(messageId)) return;
-	processedMessageIds.add(messageId);
-
-	logger.info(`[PHOTO] ${username}`);
-	await enqueueMessage(ctx, caption, username, messageId, ['(photo_placeholder)']);
-});
-
-// Handler: Sticker
-bot.on('sticker', async (ctx) => {
-	const user = ctx.from;
-	const username = formatName(user);
-	const messageId = ctx.message.message_id;
-
-	if (processedMessageIds.has(messageId)) return;
-	processedMessageIds.add(messageId);
-
-	const emoji = ctx.message.sticker.emoji || '';
-	const setName = ctx.message.sticker.set_name || '';
-	logger.info(`[STICKER] ${username}: ${emoji} (${setName})`);
-	await enqueueMessage(ctx, `[STICKER: ${emoji}]`, username, messageId);
-});
-
-// Handler: Forwarded messages (add context about forwarding)
-bot.on('message', async (ctx, next) => {
-	const msg = ctx.message as any;
-	if (msg.forward_origin || msg.forward_from || msg.forward_from_chat) {
-		const user = ctx.from;
-		const username = formatName(user);
-		const messageId = msg.message_id;
-
-		if (processedMessageIds.has(messageId)) return;
-		processedMessageIds.add(messageId);
-
-		const forwardFrom = msg.forward_from?.username
-			? `@${msg.forward_from.username}`
-			: msg.forward_from_chat?.title || 'unknown';
-		const text = msg.text || msg.caption || '';
-		logger.info(`[FORWARD] ${username} forwarded from ${forwardFrom}`);
-		await enqueueMessage(ctx, `[FORWARDED from ${forwardFrom}] ${text}`, username, messageId);
-		return; // Don't pass to next handlers
-	}
-	return next();
-});
-
-// Video Processing
-async function processVideo(videoUrl: string): Promise<string[]> {
-	const tempFile = path.join(os.tmpdir(), `vid_${Date.now()}.mp4`);
-	const outputPattern = path.join(os.tmpdir(), `frame_${Date.now()}_%d.jpg`);
-	try {
-		const w = await axios.get(videoUrl, { responseType: 'stream' });
-		await fsPromises.writeFile(tempFile, w.data);
-		const duration: number = await new Promise((resolve, reject) => {
-			ffmpeg.ffprobe(tempFile, (err, metadata) => { err ? reject(err) : resolve(metadata.format.duration || 0); });
-		});
-		const timestamps = duration > 0 ? [0.1 * duration, 0.5 * duration, 0.9 * duration] : [0];
-		const frames: string[] = [];
-		for (let i = 0; i < timestamps.length; i++) {
-			const framePath = outputPattern.replace('%d', i.toString());
-			await new Promise<void>((resolve, reject) => {
-				ffmpeg(tempFile).screenshots({ timestamps: [timestamps[i]], filename: path.basename(framePath), folder: path.dirname(framePath), size: '640x?' })
-					.on('end', () => resolve())
-					.on('error', reject);
+			await file.save(currentContent + content, {
+				metadata: { contentType: 'text/plain' }
 			});
-			if (fs.existsSync(framePath)) {
-				const imgData = await fsPromises.readFile(framePath, { encoding: 'base64' });
-				frames.push(`data:image/jpeg;base64,${imgData}`);
-				await fsPromises.unlink(framePath).catch(() => { });
-			}
+		} catch (error) {
+			logger.error({ error }, `Failed to write ${filename} to GCS, falling back to local`);
+			fs.appendFileSync(filename, content, 'utf-8');
 		}
-		return frames;
-	} catch (e) { logger.error({ error: e }, 'Video error'); return []; } // cleanup omitted for brevity
+	} else {
+		fs.appendFileSync(filename, content, 'utf-8');
+	}
 }
 
-// Handler: Audio/Video
+// Log request and response
+async function logRequest(apiName: string, messages: any[], response: string, username: string, model: string) {
+	try {
+		const timestamp = new Date().toISOString();
+		const identity = IDENTITY.substring(0, 30) + (IDENTITY.length > 30 ? '...' : '');
+		const messagesPreview = messages
+			.filter((m: any) => m.role !== 'system')
+			.map((m: any) => {
+				const name = m.name ? `${m.name}: ` : '';
+				const content = m.content.length > 100
+					? m.content.substring(0, 100) + '...'
+					: m.content;
+				return `  [${m.role}] ${name}${content}`;
+			})
+			.join('\n');
+
+		const logEntry = `
+================================================================================
+[${timestamp}] ${apiName} Request from @${username}
+Model: ${model}
+Identity (first 30 chars): ${identity}
+
+Messages sent:
+${messagesPreview}
+
+Response:
+${response}
+
+================================================================================
+`;
+		const logFile = apiName.includes('Grok') || apiName.includes('xAI') ? GROK_LOGS_FILE : OPENAI_LOGS_FILE;
+		await appendToLogFile(logFile, logEntry);
+	} catch (error) {
+		logger.error({ error }, `Failed to log ${apiName} request`);
+	}
+}
+
+// Grok streaming response
+async function getKrapralStreamFromGrok(text: string, username: string) {
+	const messages = [
+		{ role: 'system' as const, content: IDENTITY },
+		...history.map(m => ({ role: m.role as 'user' | 'assistant', name: m.name, content: m.content })),
+		{ role: 'user' as const, name: username, content: text }
+	];
+
+	const typedMessages = messages.map(m => ({
+		role: m.role,
+		name: ('name' in m && m.name) ? m.name.replace(/[^a-zA-Z0-9_-]/g, '_') : undefined,
+		content: m.content
+	}));
+
+	try {
+		const stream = await grok.chat.completions.create({
+			model: 'grok-beta',
+			messages: typedMessages as any,
+			temperature: 1.2,
+			max_tokens: 1000,
+			stream: true
+		});
+		return stream;
+	} catch (err: any) {
+		logger.error({ error: { message: err.message, status: err.status, type: err.type } }, 'Grok API error');
+		throw err;
+	}
+}
+
+// OpenAI streaming response
+async function getKrapralStreamFromOpenAI(text: string, username: string) {
+	const messages = [
+		{ role: 'system' as const, content: IDENTITY },
+		...history.map(m => ({
+			role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+			content: m.name ? `${m.name}: ${m.content}` : m.content
+		})),
+		{ role: 'user' as const, content: `${username}: ${text}` }
+	];
+
+	try {
+		const stream = await openai.chat.completions.create({
+			model: 'gpt-4o',
+			messages: messages,
+			temperature: 1.2,
+			max_tokens: 1000,
+			top_p: 0.95,
+			frequency_penalty: 0.7,
+			presence_penalty: 0.6,
+			stream: true
+		});
+		return stream;
+	} catch (err: any) {
+		logger.error('OpenAI API error:', err.message || err);
+		throw err;
+	}
+}
+
+// Main stream function: decides API based on second or FORCE_API
+async function getKrapralStream(text: string, username: string) {
+	const api = decideAPI();
+	const now = new Date();
+	const second = now.getSeconds();
+	logger.info(`Using ${api.toUpperCase()} API (based on current second: ${second})`);
+
+	try {
+		if (api === 'openai') {
+			const result = await getKrapralStreamFromOpenAI(text, username);
+			return { stream: result, api: 'openai', model: 'gpt-4o' };
+		} else {
+			const result = await getKrapralStreamFromGrok(text, username);
+			return { stream: result, api: 'grok', model: 'grok-beta' };
+		}
+	} catch (error) {
+		logger.warn(`Primary API ${api} failed, trying fallback...`);
+		// Fallback logic
+		if (api === 'openai') {
+			const result = await getKrapralStreamFromGrok(text, username);
+			return { stream: result, api: 'grok', model: 'grok-beta' };
+		} else {
+			const result = await getKrapralStreamFromOpenAI(text, username);
+			return { stream: result, api: 'openai', model: 'gpt-4o' };
+		}
+	}
+}
+
+// === BOT SETUP ===
+const bot = new Telegraf(TOKEN);
+bot.start(ctx => ctx.reply('Крапрал на посту. Пятая точка в строю.'));
+
+// Handle incoming text (used for both text and transcribed messages)
+async function handleIncomingText(ctx: any, text: string, username: string, messageId: number, chatType: string = 'private') {
+	if (processedMessageIds.has(messageId)) {
+		return;
+	}
+	processedMessageIds.add(messageId);
+
+	const chatId = ctx.chat?.id;
+
+	history.push({
+		role: 'user',
+		name: username,
+		content: text,
+		timestamp: Date.now(),
+		message_id: messageId,
+		chat_id: chatId
+	});
+	saveHistory();
+
+	const shouldSpeak = shouldKrapralSpeak(username, text, chatType, chatId);
+	if (!shouldSpeak) {
+		logger.info(`[SILENT] Krapral not replying to "${text}" from ${username}`);
+		return;
+	}
+
+	logger.info(`[REPLY] Krapral decided to reply to "${text}" from ${username}`);
+	let sentMessageInfo: any = null;
+	let fullResponse = '';
+
+	try {
+		await ctx.sendChatAction('typing');
+
+		const result = await getKrapralStream(text, username);
+		const { stream, api, model } = result;
+		const apiName = api === 'openai' ? `OpenAI (${model})` : `Grok (${model})`;
+		logger.info(`Krapral replying to ${username} | API: ${apiName}`);
+
+		// Send placeholder message
+		sentMessageInfo = await ctx.reply('...');
+
+		let lastEditTime = Date.now();
+		let buffer = '';
+
+		for await (const chunk of stream) {
+			const content = chunk.choices[0]?.delta?.content || '';
+			if (content) {
+				fullResponse += content;
+				buffer += content;
+				const now = Date.now();
+
+				if (now - lastEditTime > 1500 || buffer.length > 50) {
+					try {
+						await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+						lastEditTime = now;
+						buffer = '';
+					} catch (ignore) { }
+				}
+			}
+		}
+
+		// Final update
+		if (fullResponse && buffer.length > 0) {
+			try {
+				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+			} catch (ignore) { }
+		}
+
+		// Log full request
+		const originalMessages = [
+			{ role: 'system', content: IDENTITY },
+			...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
+			{ role: 'user', name: username, content: text }
+		];
+		await logRequest(api === 'grok' ? 'Grok' : 'OpenAI', originalMessages, fullResponse, username, model);
+	} catch (error) {
+		logger.error({ error }, 'Error during streaming response');
+		fullResponse = 'Так точно... связь пропала. Пятая точка всё ещё в строю.';
+		if (sentMessageInfo) {
+			await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+		} else {
+			await ctx.reply(fullResponse);
+		}
+	}
+
+	let responseText = fullResponse;
+	let actionDescription = '';
+
+	// 1. Handle reactions: [REACT:emoji]
+	const reactMatch = responseText.match(/\[REACT:(.+?)\]/);
+	if (reactMatch) {
+		const emoji = reactMatch[1].trim();
+		responseText = responseText.replace(reactMatch[0], '').trim();
+
+		if (sentMessageInfo) {
+			try {
+				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText || '...');
+			} catch (e) { }
+		}
+
+		try {
+			await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji }]);
+			logger.info(`[REACTION] Set reaction ${emoji} to message ${messageId}`);
+			if (!responseText) actionDescription = `(Reaction: ${emoji})`;
+		} catch (e: any) {
+			logger.warn({ error: e.message }, `Failed to set reaction ${emoji}`);
+		}
+	}
+
+	// 2. Handle polls: [POLL:Question|Option1|Option2]
+	const pollMatch = responseText.match(/\[POLL:(.+?)\]/);
+	if (pollMatch) {
+		const pollContent = pollMatch[1];
+		responseText = responseText.replace(pollMatch[0], '').trim();
+
+		if (sentMessageInfo) {
+			try {
+				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText || '...');
+			} catch (e) { }
+		}
+
+		const parts = pollContent.split('|').map(p => p.trim()).filter(p => p);
+		if (parts.length >= 3) {
+			const question = parts[0];
+			const options = parts.slice(1);
+			try {
+				await ctx.replyWithPoll(question, options, { is_anonymous: false });
+				logger.info(`[POLL] Created poll: ${question}`);
+				if (!responseText && !actionDescription) actionDescription = `(Created poll: ${question})`;
+				else if (actionDescription) actionDescription += `, (Created poll: ${question})`;
+			} catch (e: any) {
+				logger.error({ error: e.message }, `Failed to create poll`);
+				responseText += `\n(Не смог создать опрос, командир...)`;
+			}
+		}
+	}
+
+	// Save to history
+	const historyContent = responseText || actionDescription || '(Action performed)';
+	history.push({
+		role: 'assistant',
+		name: '@Krapral',
+		content: historyContent,
+		timestamp: Date.now(),
+		chat_id: ctx.chat?.id
+	});
+	saveHistory();
+}
+
+// Text handler
+bot.on('text', async (ctx) => {
+	const msg = ctx.message;
+	if (!msg || !msg.text) return;
+	const messageId = msg.message_id;
+	const username = formatName(msg.from);
+	const text = msg.text.trim();
+	const chatType = ctx.chat.type;
+	await handleIncomingText(ctx, text, username, messageId, chatType);
+});
+
+// Audio/voice/video transcription handler
 async function handleAudioTranscription(ctx: any) {
 	const msg = ctx.message;
 	if (!msg) return;
 	const messageId = msg.message_id;
 	const username = formatName(ctx.from);
+	const chatType = ctx.chat.type;
 
-	if (processedMessageIds.has(messageId)) return;
-	processedMessageIds.add(messageId);
-	logger.info(`[MEDIA] Processing message ${messageId} from ${username}`);
+	if (processedMessageIds.has(messageId)) {
+		return;
+	}
 
 	try {
 		let fileId: string;
-		let isVideo = false;
 		if (msg.voice) fileId = msg.voice.file_id;
 		else if (msg.audio) fileId = msg.audio.file_id;
-		else if (msg.video) { fileId = msg.video.file_id; isVideo = true; }
-		else if (msg.video_note) { fileId = msg.video_note.file_id; isVideo = true; }
+		else if (msg.video) fileId = msg.video.file_id;
+		else if (msg.video_note) fileId = msg.video_note.file_id;
 		else return;
 
 		const fileLink = await ctx.telegram.getFileLink(fileId);
-		let frames: string[] = [];
-		if (isVideo) frames = await processVideo(fileLink.toString());
 
 		const response = await axios.get(fileLink.toString(), { responseType: 'stream' });
 		const chunks: Buffer[] = [];
-		for await (const chunk of response.data) chunks.push(Buffer.from(chunk));
+		for await (const chunk of response.data) {
+			chunks.push(Buffer.from(chunk));
+		}
 		const audioBuffer = Buffer.concat(chunks);
 		const audioFile = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' });
 
 		const transcript = await openai.audio.transcriptions.create({
-			model: 'whisper-1', file: audioFile, language: 'ru'
+			model: 'whisper-1',
+			file: audioFile,
+			language: 'ru'
 		});
-		const text = transcript.text.trim();
-		if (text) {
-			logger.info(`[TRANSCRIPT] ${username}: ${text}`);
-			await enqueueMessage(ctx, text, username, messageId, frames);
-		}
-	} catch (e) {
-		logger.error({ error: e }, 'Transcription failed');
+
+		const transcribedText = transcript.text.trim();
+		if (!transcribedText) return;
+
+		logger.info(`Audio transcribed for ${username}: "${transcribedText}"`);
+		await handleIncomingText(ctx, transcribedText, username, messageId, chatType);
+	} catch (error: any) {
+		logger.error({
+			error: error?.message || error,
+			stack: error?.stack,
+			username,
+			messageId
+		}, 'Error processing audio/video transcription');
 	}
 }
 
 bot.on(['voice', 'audio', 'video', 'video_note'], handleAudioTranscription);
-
-// 1. Capture New Polls
-bot.on('message', async (ctx, next) => {
-	if (ctx.message && 'poll' in ctx.message) {
-		const p = ctx.message.poll;
-		const newPoll: PollData = {
-			id: p.id,
-			chatId: ctx.chat.id,
-			question: p.question,
-			options: p.options,
-			total_voter_count: p.total_voter_count,
-			is_closed: p.is_closed,
-			startTime: Date.now(),
-			voters: new Set(),
-			aiCommented: false
-		};
-		activePolls.set(p.id, newPoll);
-		logger.info(`[POLL] New poll detected: ${p.question}`);
-	}
-	return next();
-});
-
-// 2. Track Poll Answers (Who voted)
-bot.on('poll_answer', async (ctx) => {
-	const answer = ctx.pollAnswer;
-	const pollId = answer.poll_id;
-	const user = answer.user;
-	const username = formatName(user);
-
-	// We might not have the poll if we restarted or missed creation
-	// But we can still try to track if we have it
-	const poll = activePolls.get(pollId);
-	if (poll) {
-		poll.voters.add(username);
-		// We don't get new counts here, only who voted. 
-		// We wait for 'poll' update for counts, OR we assume +1? 
-		// Telegram sends 'poll' update separately.
-		await checkPollAndComment(poll);
-	}
-});
-
-// 3. Track Poll State (Counts)
-bot.on('poll', async (ctx) => {
-	const p = ctx.poll;
-	const poll = activePolls.get(p.id);
-	if (poll) {
-		poll.total_voter_count = p.total_voter_count;
-		poll.options = p.options;
-		poll.is_closed = p.is_closed;
-		await checkPollAndComment(poll);
-	}
-});
 
 // HTTP Server for Cloud Run
 const PORT = process.env.PORT || 8080;
@@ -806,30 +564,61 @@ const server = http.createServer(async (req, res) => {
 	}
 	if (req.url === '/webhook' && req.method === 'POST') {
 		let body = '';
-		req.on('data', chunk => body += chunk.toString());
+		req.on('data', (chunk: any) => { body += chunk.toString(); });
 		req.on('end', async () => {
 			try {
 				await bot.handleUpdate(JSON.parse(body));
-				res.writeHead(200); res.end('OK');
-			} catch (e) { res.writeHead(500); res.end('Error'); }
+				res.writeHead(200, { 'Content-Type': 'text/plain' });
+				res.end('OK');
+			} catch (err) {
+				logger.error({ error: err }, 'Webhook error');
+				res.writeHead(500, { 'Content-Type': 'text/plain' });
+				res.end('Error');
+			}
 		});
 		return;
 	}
-	res.writeHead(404); res.end('Not Found');
+	res.writeHead(404, { 'Content-Type': 'text/plain' });
+	res.end('Not Found');
 });
 
 server.listen(PORT, async () => {
-	logger.info(`HTTP server on port ${PORT}`);
+	logger.info(`HTTP server listening on port ${PORT}`);
+
 	if (process.env.NODE_ENV === 'production' || process.env.USE_WEBHOOK === 'true') {
-		const webhookUrl = process.env.WEBHOOK_URL ? `${process.env.WEBHOOK_URL}/webhook` : null;
+		const webhookUrl = process.env.WEBHOOK_URL || process.env.K_SERVICE_URL
+			? `${process.env.WEBHOOK_URL || process.env.K_SERVICE_URL}/webhook`
+			: null;
 		if (webhookUrl) {
-			try { await bot.telegram.setWebhook(webhookUrl); logger.info(`Webhook: ${webhookUrl}`); }
-			catch (e) { bot.launch({ dropPendingUpdates: true }); }
-		} else { bot.launch({ dropPendingUpdates: true }); }
+			try {
+				await bot.telegram.setWebhook(webhookUrl);
+				logger.info(`Webhook set to: ${webhookUrl}`);
+				logger.info('Krapral 3.0 on duty (Webhook mode)');
+			} catch (err) {
+				logger.error({ error: err }, 'Failed to set webhook, falling back to polling');
+				bot.launch({ dropPendingUpdates: true });
+			}
+		} else {
+			logger.warn('WEBHOOK_URL not set, using polling mode');
+			bot.launch({ dropPendingUpdates: true });
+		}
 	} else {
-		bot.launch();
+		bot.launch({ dropPendingUpdates: true });
+		logger.info('Krapral 3.0 on duty (Polling mode)');
+	}
+
+	if (FORCE_API) {
+		logger.info(`MODE: ${FORCE_API.toUpperCase()} (forced, seconds ignored)`);
+	} else {
+		logger.info('MODE: AUTO (API chosen by second)');
 	}
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+	server.close();
+	bot.stop('SIGINT');
+});
+process.once('SIGTERM', () => {
+	server.close();
+	bot.stop('SIGTERM');
+});

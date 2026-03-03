@@ -1,32 +1,38 @@
 # Rollback Reference
 
-## Current Production (GCloud)
-- **Branch**: `main`
-- **Commit**: `68d0aab` — "update bot checklist and identity structure for improved functionality and clarity"
-- **Pre-Grok**: This is the last version running OpenAI-only (GPT-5.2 for all responses)
+## Deployment History
+
+| Version | Image Digest | Description | Deployed |
+|---------|-------------|-------------|----------|
+| **v3.1 (current)** | `41210d081a98` | Grok primary + OpenAI fallback | 2026-03-03 |
+| **v3.0 (previous)** | `81a1c840a32b` | Last deploy before Grok (OpenAI-only) | 2026-01-22 |
+| **new-branch-release** | `167e0f23051e` | — | 2026-01-16 |
+| **final-release** | `1094f7786838` | — | 2026-01-15 |
 
 ## How to Rollback
 
-### Option 1: Redeploy old commit via Cloud Build
+### Option 1: Redeploy previous container image (fastest, no git changes)
 ```bash
-git checkout main
-git reset --hard 68d0aab
-git push --force origin main
-# Cloud Build trigger will redeploy automatically
-```
-
-### Option 2: Redeploy old container image directly
-```bash
-# The image tagged with the short SHA should still be in Container Registry
+# Roll back to pre-Grok version (Jan 22):
 gcloud run deploy krapral-bot \
-  --image gcr.io/YOUR_PROJECT_ID/krapral-bot:68d0aab \
-  --region us-central1 \
+  --image gcr.io/vladomarenko/krapral-bot@sha256:81a1c840a32b2d21e701b5afa1bb0de14456bb026b0ab11f0a7c71f7001aa304 \
+  --region europe-west1 \
   --platform managed
+
+# List all available images:
+gcloud container images list-tags gcr.io/vladomarenko/krapral-bot
 ```
 
-### Option 3: Revert commit (safer — no force push)
+### Option 2: Revert git commit and redeploy
 ```bash
 git checkout main
-git revert HEAD --no-edit   # Creates a new commit that undoes the last one
-git push origin main
+git revert HEAD --no-edit
+./deploy-cloud-build.sh
+```
+
+### Option 3: Reset git to specific commit and redeploy
+```bash
+git checkout main
+git reset --hard COMMIT_HASH
+./deploy-cloud-build.sh
 ```
