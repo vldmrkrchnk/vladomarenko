@@ -355,6 +355,19 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	const shouldSpeak = shouldKrapralSpeak(username, text, chatType, chatId);
 	if (!shouldSpeak) {
 		logger.info(`[SILENT] Krapral not replying to "${text}" from ${username}`);
+
+		// 25% chance to put a silent reaction even when not replying
+		if (chatType !== 'private' && Math.random() < 0.25) {
+			const SILENT_REACTIONS = ['😂', '🔥', '👍', '🫡', '❤️', '👀', '🤔', '💯'];
+			const emoji = SILENT_REACTIONS[Math.floor(Math.random() * SILENT_REACTIONS.length)];
+			try {
+				await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji }]);
+				logger.info(`[SILENT REACTION] ${emoji} on message ${messageId} from ${username}`);
+			} catch (e: any) {
+				logger.warn({ error: e.message }, `Failed to set silent reaction ${emoji}`);
+			}
+		}
+
 		return;
 	}
 
