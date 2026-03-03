@@ -20,16 +20,27 @@ const logger = pino({
 const TOKEN = process.env.TELEGRAM_TOKEN!;
 const GROK_KEY = process.env.GROK_API_KEY!;
 const OPENAI_KEY = process.env.OPENAI_API_KEY!;
-const IDENTITY = fs.readFileSync('identity.txt', 'utf-8');
+// Load identity and inject users.json into the placeholder
+const RAW_IDENTITY = fs.readFileSync('identity.txt', 'utf-8');
+const USERS_JSON_CONTENT = fs.existsSync('users.json') ? fs.readFileSync('users.json', 'utf-8') : '{}';
+const IDENTITY = RAW_IDENTITY.replace(
+	/\[ВСТАВЬ СЮДА ВЕСЬ ТВОЙ JSON ИЗ ПЕРВОГО СООБЩЕНИЯ\]/,
+	USERS_JSON_CONTENT
+);
 
-// Force API mode from environment variable (overrides seconds check)
-// Set FORCE_API=grok or FORCE_API=openai to force a specific API
-const FORCE_API = process.env.FORCE_API?.toLowerCase();
+// Dev mode: console logging only, no file/GCS writes
+const DEV_MODE = process.env.BOT_MODE === 'dev';
 
-// Initialize OpenAI client
+// Only respond in this group (and DMs). In dev mode, allow any chat for testing.
+const ALLOWED_CHAT_ID = -1001826428556;
+
+// Grok model for responses
+const GROK_MODEL = 'grok-4-1-fast-non-reasoning';
+
+// Initialize OpenAI client (used only for Whisper transcription)
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// Initialize Grok client (using OpenAI SDK compatibility)
+// Initialize Grok client (primary response model)
 const grok = new OpenAI({
 	apiKey: GROK_KEY,
 	baseURL: 'https://api.x.ai/v1'
@@ -37,7 +48,9 @@ const grok = new OpenAI({
 
 // GCP Cloud Storage for log files (OPTIONAL - only needed for serverless services)
 let gcsBucket: any = null;
-if (process.env.GCP_STORAGE_BUCKET) {
+if (DEV_MODE) {
+	logger.info('[DEV MODE] File/GCS logging disabled — console only');
+} else if (process.env.GCP_STORAGE_BUCKET) {
 	try {
 		const { Storage } = require('@google-cloud/storage');
 		const storage = new Storage();
@@ -63,8 +76,7 @@ interface Msg {
 // Global State
 let history: Msg[] = [];
 const HISTORY_FILE = 'last_50.json';
-const GROK_LOGS_FILE = 'grok_requests.log';
-const OPENAI_LOGS_FILE = 'openai_requests.log';
+const LOGS_FILE = 'grok_requests.log';
 const MIN_MESSAGES_BETWEEN_RESPONSES = 5;
 const USERS_FILE = 'users.json';
 
@@ -101,7 +113,8 @@ if (fs.existsSync(HISTORY_FILE)) {
 }
 
 function saveHistory() {
-	fs.writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-50), null, 2));
+	fs.promises.writeFile(HISTORY_FILE, JSON.stringify(history.slice(-50), null, 2))
+		.catch(err => logger.error({ error: err }, 'Failed to save history'));
 }
 
 function formatName(user: any): string {
@@ -173,37 +186,18 @@ function shouldKrapralSpeak(username: string, text: string, chatType: string, ch
 	return false;
 }
 
-// API selection: based on current second or forced mode
-function decideAPI(): string {
-	if (FORCE_API === 'grok' || FORCE_API === 'openai') {
-		return FORCE_API;
-	}
-	const now = new Date();
-	const second = now.getSeconds();
-	const lastDigit = second % 10;
-	// Odd → OpenAI, Even → Grok
-	if ([1, 3, 5, 7, 9].includes(lastDigit)) {
-		return 'openai';
-	}
-	return 'grok';
-}
 
-// Log file writer (local or GCS)
+// Log file writer (local or GCS) — skipped in dev mode
 async function appendToLogFile(filename: string, content: string) {
+	if (DEV_MODE) return;
 	if (gcsBucket) {
 		try {
-			const file = gcsBucket.file(`logs/${filename}`);
-			const [exists] = await file.exists();
-			let currentContent = '';
-			if (exists) {
-				try {
-					const [buffer] = await file.download();
-					currentContent = buffer.toString('utf-8');
-				} catch (e) {
-					currentContent = '';
-				}
-			}
-			await file.save(currentContent + content, {
+			// Write each entry as a separate file to avoid download+append+re-upload
+			const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+			const base = filename.replace(/\.[^.]+$/, '');
+			const ext = filename.includes('.') ? filename.slice(filename.lastIndexOf('.')) : '.log';
+			const entryFile = gcsBucket.file(`logs/${base}/${timestamp}${ext}`);
+			await entryFile.save(content, {
 				metadata: { contentType: 'text/plain' }
 			});
 		} catch (error) {
@@ -245,15 +239,42 @@ ${response}
 
 ================================================================================
 `;
-		const logFile = apiName.includes('Grok') || apiName.includes('xAI') ? GROK_LOGS_FILE : OPENAI_LOGS_FILE;
+		const logFile = LOGS_FILE;
 		await appendToLogFile(logFile, logEntry);
 	} catch (error) {
 		logger.error({ error }, `Failed to log ${apiName} request`);
 	}
 }
 
+// Detect censorship / broken responses that should be retried or suppressed
+const CENSORSHIP_PATTERNS = [
+	/^извини(те)?,?\s*(я\s+)?не\s+могу/i,
+	/^i'?m\s+sorry,?\s*i\s+can'?t/i,
+	/^sorry,?\s*i\s+can'?t/i,
+	/^i\s+can'?t\s+assist/i,
+	/^я\s+не\s+могу\s+помочь/i,
+	/^к сожалению,?\s*(я\s+)?не\s+могу/i,
+	/^as an ai/i,
+	/^как (ии|искусственный интеллект)/i,
+];
+
+function isCensoredResponse(text: string): boolean {
+	const trimmed = text.trim();
+	return CENSORSHIP_PATTERNS.some(p => p.test(trimmed));
+}
+
+function isEmptyResponse(text: string): boolean {
+	const trimmed = text.trim();
+	return !trimmed || /^\.{1,3}(\s*\(.*\))?$/.test(trimmed);
+}
+
+// Strip "@Krapral:" prefix that the model sometimes adds
+function cleanBotPrefix(text: string): string {
+	return text.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '').trim();
+}
+
 // Grok streaming response
-async function getKrapralStreamFromGrok(text: string, username: string) {
+async function getKrapralStream(text: string, username: string) {
 	const messages = [
 		{ role: 'system' as const, content: IDENTITY },
 		...history.map(m => ({ role: m.role as 'user' | 'assistant', name: m.name, content: m.content })),
@@ -266,75 +287,20 @@ async function getKrapralStreamFromGrok(text: string, username: string) {
 		content: m.content
 	}));
 
+	logger.info(`Using Grok API (model: ${GROK_MODEL})`);
+
 	try {
 		const stream = await grok.chat.completions.create({
-			model: 'grok-beta',
+			model: GROK_MODEL,
 			messages: typedMessages as any,
 			temperature: 1.2,
-			max_tokens: 1000,
+			max_tokens: 2000,
 			stream: true
 		});
-		return stream;
+		return { stream, api: 'grok', model: GROK_MODEL };
 	} catch (err: any) {
 		logger.error({ error: { message: err.message, status: err.status, type: err.type } }, 'Grok API error');
 		throw err;
-	}
-}
-
-// OpenAI streaming response
-async function getKrapralStreamFromOpenAI(text: string, username: string) {
-	const messages = [
-		{ role: 'system' as const, content: IDENTITY },
-		...history.map(m => ({
-			role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-			content: m.name ? `${m.name}: ${m.content}` : m.content
-		})),
-		{ role: 'user' as const, content: `${username}: ${text}` }
-	];
-
-	try {
-		const stream = await openai.chat.completions.create({
-			model: 'gpt-4o',
-			messages: messages,
-			temperature: 1.2,
-			max_tokens: 1000,
-			top_p: 0.95,
-			frequency_penalty: 0.7,
-			presence_penalty: 0.6,
-			stream: true
-		});
-		return stream;
-	} catch (err: any) {
-		logger.error('OpenAI API error:', err.message || err);
-		throw err;
-	}
-}
-
-// Main stream function: decides API based on second or FORCE_API
-async function getKrapralStream(text: string, username: string) {
-	const api = decideAPI();
-	const now = new Date();
-	const second = now.getSeconds();
-	logger.info(`Using ${api.toUpperCase()} API (based on current second: ${second})`);
-
-	try {
-		if (api === 'openai') {
-			const result = await getKrapralStreamFromOpenAI(text, username);
-			return { stream: result, api: 'openai', model: 'gpt-4o' };
-		} else {
-			const result = await getKrapralStreamFromGrok(text, username);
-			return { stream: result, api: 'grok', model: 'grok-beta' };
-		}
-	} catch (error) {
-		logger.warn(`Primary API ${api} failed, trying fallback...`);
-		// Fallback logic
-		if (api === 'openai') {
-			const result = await getKrapralStreamFromGrok(text, username);
-			return { stream: result, api: 'grok', model: 'grok-beta' };
-		} else {
-			const result = await getKrapralStreamFromOpenAI(text, username);
-			return { stream: result, api: 'openai', model: 'gpt-4o' };
-		}
 	}
 }
 
@@ -349,7 +315,20 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	}
 	processedMessageIds.add(messageId);
 
+	// Prune processedMessageIds to prevent memory leak — keep last 1000
+	if (processedMessageIds.size > 1000) {
+		const ids = Array.from(processedMessageIds);
+		const toDelete = ids.slice(0, ids.length - 1000);
+		for (const id of toDelete) processedMessageIds.delete(id);
+	}
+
 	const chatId = ctx.chat?.id;
+
+	// Restrict to allowed group + DMs (skip in dev mode for testing)
+	if (!DEV_MODE && chatType !== 'private' && chatId !== ALLOWED_CHAT_ID) {
+		logger.debug(`[IGNORED] Message from unauthorized chat ${chatId}`);
+		return;
+	}
 
 	history.push({
 		role: 'user',
@@ -375,12 +354,11 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 		await ctx.sendChatAction('typing');
 
 		const result = await getKrapralStream(text, username);
-		const { stream, api, model } = result;
-		const apiName = api === 'openai' ? `OpenAI (${model})` : `Grok (${model})`;
-		logger.info(`Krapral replying to ${username} | API: ${apiName}`);
+		const { stream, model } = result;
+		logger.info(`Krapral replying to ${username} | Grok (${model})`);
 
-		// Send placeholder message
-		sentMessageInfo = await ctx.reply('...');
+		// Send placeholder message linked to the user's message
+		sentMessageInfo = await ctx.reply('...', { reply_to_message_id: messageId });
 
 		let lastEditTime = Date.now();
 		let buffer = '';
@@ -394,7 +372,8 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 
 				if (now - lastEditTime > 1500 || buffer.length > 50) {
 					try {
-						await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+						const displayText = cleanBotPrefix(fullResponse) || '...';
+						await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, displayText);
 						lastEditTime = now;
 						buffer = '';
 					} catch (ignore) { }
@@ -402,10 +381,11 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 			}
 		}
 
-		// Final update
+		// Final update with cleaned text
 		if (fullResponse && buffer.length > 0) {
 			try {
-				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+				const displayText = cleanBotPrefix(fullResponse) || '...';
+				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, displayText);
 			} catch (ignore) { }
 		}
 
@@ -415,15 +395,38 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 			...history.map(m => ({ role: m.role, name: m.name, content: m.content })),
 			{ role: 'user', name: username, content: text }
 		];
-		await logRequest(api === 'grok' ? 'Grok' : 'OpenAI', originalMessages, fullResponse, username, model);
+		await logRequest('Grok', originalMessages, fullResponse, username, model);
 	} catch (error) {
 		logger.error({ error }, 'Error during streaming response');
-		fullResponse = 'Так точно... связь пропала. Пятая точка всё ещё в строю.';
+		// Delete the placeholder message on error — stay silent instead of sending error text
 		if (sentMessageInfo) {
-			await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
-		} else {
-			await ctx.reply(fullResponse);
+			try {
+				await ctx.telegram.deleteMessage(ctx.chat.id, sentMessageInfo.message_id);
+			} catch (ignore) { }
 		}
+		logger.warn('[ERROR] API failed, staying silent instead of sending error message');
+		return;
+	}
+
+	// Clean up response: strip bot name prefix
+	fullResponse = cleanBotPrefix(fullResponse);
+
+	// Handle censored responses: delete message and stay silent
+	if (isCensoredResponse(fullResponse) || isEmptyResponse(fullResponse)) {
+		logger.warn(`[CENSORED/EMPTY] Suppressing response: "${fullResponse.substring(0, 100)}"`);
+		if (sentMessageInfo) {
+			try {
+				await ctx.telegram.deleteMessage(ctx.chat.id, sentMessageInfo.message_id);
+			} catch (ignore) { }
+		}
+		return;
+	}
+
+	// Update the message with cleaned response
+	if (sentMessageInfo) {
+		try {
+			await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
+		} catch (ignore) { }
 	}
 
 	let responseText = fullResponse;
@@ -435,9 +438,15 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 		const emoji = reactMatch[1].trim();
 		responseText = responseText.replace(reactMatch[0], '').trim();
 
-		if (sentMessageInfo) {
+		if (responseText && sentMessageInfo) {
+			// Text + reaction: update the message with the text part
 			try {
-				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText || '...');
+				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText);
+			} catch (e) { }
+		} else if (!responseText && sentMessageInfo) {
+			// Reaction-only: delete the placeholder message
+			try {
+				await ctx.telegram.deleteMessage(ctx.chat.id, sentMessageInfo.message_id);
 			} catch (e) { }
 		}
 
@@ -494,10 +503,20 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 bot.on('text', async (ctx) => {
 	const msg = ctx.message;
 	if (!msg || !msg.text) return;
+	// Ignore own messages (prevent self-reply loops)
+	if (msg.from?.is_bot && msg.from?.id === bot.botInfo?.id) return;
 	const messageId = msg.message_id;
 	const username = formatName(msg.from);
-	const text = msg.text.trim();
+	let text = msg.text.trim();
 	const chatType = ctx.chat.type;
+
+	// Include reply-to context so the model knows what the user is responding to
+	const replyMsg = (msg as any).reply_to_message;
+	if (replyMsg?.text) {
+		const replyAuthor = replyMsg.from ? formatName(replyMsg.from) : 'unknown';
+		text = `[Replying to ${replyAuthor}: "${replyMsg.text}"] ${text}`;
+	}
+
 	await handleIncomingText(ctx, text, username, messageId, chatType);
 });
 
@@ -554,6 +573,18 @@ async function handleAudioTranscription(ctx: any) {
 
 bot.on(['voice', 'audio', 'video', 'video_note'], handleAudioTranscription);
 
+// Sticker handler — extract emoji and pass to handleIncomingText
+bot.on('sticker', async (ctx) => {
+	const msg = ctx.message;
+	if (!msg?.sticker) return;
+	if (msg.from?.is_bot && msg.from?.id === bot.botInfo?.id) return;
+	const emoji = msg.sticker.emoji || '?';
+	const messageId = msg.message_id;
+	const username = formatName(msg.from);
+	const chatType = ctx.chat.type;
+	await handleIncomingText(ctx, `[STICKER: ${emoji}]`, username, messageId, chatType);
+});
+
 // HTTP Server for Cloud Run
 const PORT = process.env.PORT || 8080;
 const server = http.createServer(async (req, res) => {
@@ -607,11 +638,13 @@ server.listen(PORT, async () => {
 		logger.info('Krapral 3.0 on duty (Polling mode)');
 	}
 
-	if (FORCE_API) {
-		logger.info(`MODE: ${FORCE_API.toUpperCase()} (forced, seconds ignored)`);
-	} else {
-		logger.info('MODE: AUTO (API chosen by second)');
+	if (DEV_MODE) {
+		logger.info('========================================');
+		logger.info('  DEV MODE — console logging only');
+		logger.info('========================================');
 	}
+
+	logger.info(`MODEL: ${GROK_MODEL}`);
 });
 
 process.once('SIGINT', () => {

@@ -189,7 +189,7 @@ Automated deployment on git push.
 | `OPENAI_API_KEY` | Yes | OpenAI API key |
 | `NODE_ENV` | No | Set to `production` for JSON logging |
 | `GCP_STORAGE_BUCKET` | No | GCS bucket name (only for Cloud Run/App Engine) |
-| `FORCE_API` | No | `grok` or `openai` to force specific API |
+| `BOT_MODE` | No | `dev` for console-only logging |
 
 ## Troubleshooting
 
