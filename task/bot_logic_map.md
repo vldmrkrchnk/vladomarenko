@@ -13,28 +13,29 @@ The bot operates as a **stateful event loop** built on `Telegraf` (Telegram API)
 ## 2. Text Message Flow (The "Brain")
 
 ### Logic
-1.  **User sends text**.
+1.  **User sends text** (or sticker, forwarded message).
 2.  **Debounce**: Bot waits `4000ms`. If more messages come, they are bundled (Batching).
 3.  **Trigger Check** (in `processAccumulatedMessages`):
-    *   **Direct Mention**: (`@krapral`, reply to bot) -> **Immediate Reply**.
-    *   **Context Reply**: Did bot ask a question recently (<2 mins)? -> **Immediate Reply**.
-    *   **Gatekeeper (The "Smart" Check)**:
-        *   If neither above, call `checkContextForReply` (GPT-5.2).
+    *   **Direct Mention**: (`@krapral`, `капрал`, `крапрал`, `краб`, reply to bot) -> **Immediate Reply** (even during quiet hours).
+    *   **Context Reply**: Did bot ask a question recently (<2 mins)? -> **Immediate Reply** (even during quiet hours).
+    *   **Gatekeeper (The "Smart" Check)** (skipped during quiet hours 2-7am):
+        *   If neither above, call `checkContextForReply` (`gpt-4o-mini`).
         *   Prompt: "Is it conversationally good to speak?"
         *   Result: `YES` -> **Reply**.
         *   Result: `NO` -> **Random Chance (2%)** -> **Reply**.
 
 ### API Frequency & Cost
 *   **Gatekeeper**: 1 call per *batch* of untagged messages.
-    *   *Current Model*: `gpt-5.2` (Expensive/High Latency).
-    *   *Optimization*: High frequency.
+    *   *Model*: `gpt-4o-mini` (lightweight, fast).
 *   **Response Generation**: 1 call per *decided reply*.
-    *   *Current Model*: `gpt-5.2`.
+    *   *Model*: `gpt-5.2`.
 *   **Summarizer**: 1 call per 10 history items.
-    *   *Current Model*: `gpt-4o`.
+    *   *Model*: `gpt-4o`.
 
-** optimization Opportunity**:
-*   The **Gatekeeper** uses `gpt-5.2`. This is overkill for a simple "Yes/No" check. **Switching to `gpt-4o-mini`** would reduce cost/latency by 90% without losing quality.
+### Post-Processing
+*   **Prefix stripping**: Removes `@Krapral :`, `Krapral:`, `Bot:`, `AI:` prefixes (and recursive variants).
+*   **Refusal catching**: Detects generic AI refusals ("Извините, я не могу помочь...") and replaces them with in-character deflections.
+*   **Anti-repetition**: System prompt includes last 10 bot messages to prevent phrase repetition.
 
 ---
 
@@ -50,15 +51,13 @@ The bot operates as a **stateful event loop** built on `Telegraf` (Telegram API)
 4.  **Video Processing**:
     *   Extract 3 frames via `ffmpeg` (10%, 50%, 90% marks).
     *   Convert to Base64.
-    *   *current state*: Frames are passed to `enqueueMessage` but **NOT** added to the OpenAI payload in `getKrapralResponse`.
+    *   Frames are passed to `getKrapralResponse` as vision content parts (detail: low).
+5.  **Sticker Handling**: Emoji extracted and sent as `[STICKER: emoji]` text.
+6.  **Forwarded Messages**: Source attribution added as `[FORWARDED from source]` prefix.
 
 ### API Frequency
 *   **Whisper**: 1 call per audio/video message.
-*   **Vision**: **0 calls** (Currently unimplemented in final step).
-
-**CRITICAL OPTIMIZATION**:
-*   **Wasted Compute**: We are downloading videos, running ffmpeg, and extracting frames, but **never showing them to the AI**.
-*   *Fix*: Either disable video processing (save CPU/Bandwidth) OR update `getKrapralResponse` to accept image payloads so the bot can actually "see" the video. Currently, it's blind to the video content, only hearing the audio.
+*   **Vision**: Included in main response call when video frames are present.
 
 ---
 
@@ -84,17 +83,24 @@ The bot operates as a **stateful event loop** built on `Telegraf` (Telegram API)
 
 ---
 
-## 5. Optimization Summary Table
+## 5. Model Usage Summary
+
+| Function | Model | Frequency |
+| :--- | :--- | :--- |
+| **Main Response** | `grok-4-1-fast-non-reasoning` (primary) → `gpt-5.2` (fallback) | Per reply |
+| **Context Gatekeeper** | `gpt-4o-mini` | Per untagged message batch |
+| **Poll Analysis** | `grok-4-1-fast-non-reasoning` (primary) → `gpt-5.2` (fallback) | Once per poll (3+ votes) |
+| **Chat Summary** | `gpt-4o` | Every 10 messages |
+| **Audio Transcription** | `whisper-1` | Per audio/video message |
+
+## 6. Memory Management
+*   **History**: Last 50 messages persisted to `last_50.json` after each message.
+*   **processedMessageIds**: `Set<number>` with hourly pruning (max 5000 entries) to prevent memory leaks.
+*   **activePolls**: `Map` cleared when polls close or age out.
+
+## 7. Remaining Optimization Opportunities
 
 | Feature | Current Implementation | Optimization Opportunity | Impact |
 | :--- | :--- | :--- | :--- |
-| **Context Gatekeeper** | `gpt-5.2` on every batch | Downgrade to `gpt-4o-mini` | **$$$ Savings**, Faster "listening" |
-| **Video Processing** | Extracts frames, ignores them | **Delete code** or **Enable Vision** | CPU/Bandwidth vs Feature fix |
-| **Summarizer** | `gpt-4o` every 10 msgs | Keep as is (Reasonable) | Neutral |
-| **Main Response** | `gpt-5.2` | Keep (Persona requires high IQ) | Neutral |
 | **History** | `last_50.json` (File write every msg) | **Redis** or **In-Memory only** | Disk I/O reduction (Low prio) |
-
-## 6. Recommended Next Steps
-1.  **Fix Video Blindness**: Either feed the frames to GPT-5.2 or remove the heavy `ffmpeg` logic.
-2.  **Optimize Gatekeeper**: Switch the "Should I reply?" check to a lightweight model.
-3.  **Allow Options Flag**: Already optimized (RegEx check is effectively free).
+| **Photo handling** | Caption only, no image analysis | Feed photos to vision model | Feature enhancement |

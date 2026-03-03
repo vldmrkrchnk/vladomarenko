@@ -5,34 +5,51 @@ Production-ready 24/7 Telegram bot that 100% embodies the character "Krapral" as
 ## Features
 
 - **Full Krapral Character**: Embodies the shell-shocked ex-VDV sergeant with mild army homoerotic brotherly love
-- **Grok AI Brain**: Uses Grok API (grok-4 primary, grok-3 fallback) for intelligent responses
+- **Dual AI Brain**: Grok (primary) for uncensored in-character responses, OpenAI GPT-5.2 (fallback)
+- **Smart Reply Gating**: AI-powered context gatekeeper decides when to jump into conversation
 - **Persistent Memory**: Maintains last 50 messages with auto-save/load from `last_50.json`
-- **@Username Format**: Strictly enforces @ symbol format for all users and bots (e.g., `@FedotovAndrii`, `@Krapral`)
-- **Unknown Bot Handling**: Any bot/user not in `users.json` gets full Krapral treatment as "рядовой"
-- **Production Ready**: Full logging (pino), retry logic for API errors, graceful shutdown
+- **Rolling Chat Summary**: GPT-4o generates a 2-3 sentence vibe summary every 10 messages
+- **Multimodal**: Voice/audio transcription (Whisper), video frame extraction (FFmpeg), photo handling
+- **Poll Observer**: Monitors polls and drops roast comments when voting gets interesting
+- **Emoji Reactions**: Can react to messages with emojis via `[REACTION:emoji]` tags
+- **Internet Search**: DuckDuckGo integration for real-time information lookup
+- **Message Debouncing**: 4-second batching to handle rapid-fire group messages
+- **@Username Format**: Strictly enforces @ symbol format for all users and bots
+- **Unknown User Handling**: Any user not in `users.json` gets full Krapral treatment as "рядовой"
+- **Production Ready**: Structured logging (pino), graceful shutdown, Docker + Cloud Run support
 
 ## Project Structure
 
 ```
 ├── src/
-│   └── bot.ts              # Main bot implementation
-├── identity.txt            # Full system prompt (biography, styles, rules)
-├── users.json              # User database with roles and relationships
-├── last_50.json           # Auto-created message history (last 50 messages)
-├── .env                   # Environment variables (TELEGRAM_TOKEN, GROK_API_KEY)
-├── tsconfig.json          # TypeScript configuration
-├── package.json           # Dependencies and scripts
-├── ecosystem.config.js    # PM2 configuration for production
-└── README.md              # This file
+│   └── bot.ts              # Main bot implementation (~700 lines)
+├── dist/                    # Compiled JavaScript output
+├── task/                    # Improvement task specs & analysis
+│   ├── task.md             # Work packages specification
+│   ├── bot_logic_map.md    # Architecture & optimization analysis
+│   └── checklist.md        # Progress tracking
+├── identity.txt            # Character system prompt (biography, styles, rules)
+├── users.json              # User profiles database (roles, relationships, tone)
+├── last_50.json            # Auto-created message history (last 50 messages)
+├── .env                    # Environment variables
+├── Dockerfile              # Multi-stage Docker build (node:20-slim)
+├── cloudbuild.yaml         # Google Cloud Build CI/CD config
+├── deploy*.sh              # Deployment scripts (Cloud Run, Cloud Build)
+├── ecosystem.config.js     # PM2 configuration for production
+├── tsconfig.json           # TypeScript configuration
+├── package.json            # Dependencies and scripts
+├── DEPLOYMENT.md           # Detailed GCP deployment guide
+├── QUICK_START.md          # Quick deploy guide
+└── README.md               # This file
 ```
 
 ## Prerequisites
 
-- Node.js 18+ 
+- Node.js 18+
 - npm or yarn
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
-- Grok API Key (from [x.ai](https://x.ai))
 - OpenAI API Key (from [OpenAI](https://platform.openai.com))
+- Grok API Key (from [xAI](https://console.x.ai))
 
 ## Quick Deploy to Google Cloud
 
@@ -57,8 +74,8 @@ Create/update `.env` file:
 
 ```env
 TELEGRAM_TOKEN=your_telegram_bot_token_here
-GROK_API_KEY=your_grok_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
+GROK_API_KEY=your_grok_api_key_here
 
 # Optional: Google Cloud Platform integration
 GCP_STORAGE_BUCKET=your-gcs-bucket-name  # For storing log files in Cloud Storage
@@ -150,81 +167,37 @@ sudo systemctl start krapral-bot
 sudo systemctl status krapral-bot
 ```
 
-## Google Cloud Platform Integration
-
-The bot supports Google Cloud Platform for production deployment.
-
-### Features
-
-- **Cloud Logging**: Application logs (pino) automatically sent to GCP Cloud Logging when `NODE_ENV=production` or `GCP_ENV=true`
-- **Log Files**: Written to local files by default (works on Compute Engine VMs)
-- **Cloud Storage** (optional): Only needed for serverless services (Cloud Run, App Engine, Functions)
-
-### When Do You Need a Bucket?
-
-**You DON'T need a bucket if:**
-- Running on **Compute Engine** (VM) → Files are written to local disk (persistent if using persistent disk)
-- Running locally → Files are written to project directory
-
-**You DO need a bucket if:**
-- Running on **Cloud Run** → Ephemeral filesystem, files are lost on restart
-- Running on **App Engine** → Ephemeral filesystem
-- Running on **Cloud Functions** → Ephemeral filesystem
-
-### Setup
-
-#### Option 1: Compute Engine (No Bucket Needed)
-
-1. Deploy to a Compute Engine VM
-2. Logs are written to local files: `grok_requests.log`, `openai_requests.log`
-3. Access files via SSH or mount a persistent disk
-
-#### Option 2: Cloud Run / App Engine (Bucket Required)
-
-1. **Create a GCS Bucket**:
-   ```bash
-   gsutil mb gs://your-bucket-name
-   ```
-
-2. **Set up Authentication**:
-   - Service account is automatically configured for Cloud Run/App Engine
-   - For local testing: Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`
-
-3. **Configure Environment Variables**:
-   ```env
-   GCP_STORAGE_BUCKET=your-bucket-name  # Required for Cloud Run/App Engine
-   NODE_ENV=production                  # Enables JSON logging for Cloud Logging
-   ```
-
-4. **View Logs**:
-   - **Application logs**: GCP Console → Logging → Logs Explorer
-   - **Log files**: GCS Console → Your bucket → `logs/` folder
-   - **Sync log files locally**:
-     ```bash
-     gsutil -m rsync -r gs://your-bucket-name/logs ./logs
-     ```
-
-### Log Files Location
-
-- **Compute Engine / Local**: `grok_requests.log`, `openai_requests.log` (in project root)
-- **Cloud Storage** (if configured): `gs://your-bucket-name/logs/grok_requests.log`, `gs://your-bucket-name/logs/openai_requests.log`
-
 ## How It Works
 
-1. **Message Reception**: Bot receives text messages from any user or bot
-2. **Username Formatting**: Every username is formatted with @ symbol (e.g., `@FedotovAndrii`)
-3. **System Prompt**: Loads entire `identity.txt` as system prompt for Grok API
-4. **Message History**: Attaches last 50 messages (including Krapral's replies) in OpenAI format with correct @names
-5. **Step 1 - Grok API Call**: Sends request to Grok API (grok-4) to get initial response
-6. **Step 2 - OpenAI Refinement**: Sends Grok's response + original context to OpenAI (gpt-4o) for validation and uniqueness
-7. **Response**: Krapral responds with OpenAI's refined response (more unique and validated)
-8. **History Update**: Saves user message and Krapral's response to `last_50.json`
+1. **Message Reception**: Bot receives messages (text, photo, voice, video) from users
+2. **Debounce Buffer**: Messages are batched in a 4-second window to handle rapid messages
+3. **Trigger Check**:
+   - Direct mention (`@krapral`, `крапрал`, `капрал`, `краб`) or reply to bot → Reply immediately
+   - Bot asked a question <2 minutes ago → Reply (conversational continuity)
+   - Otherwise → AI gatekeeper (GPT-4o-mini) decides if Krapral should jump in
+   - Fallback: 2% random chance during non-quiet hours (2am-7am excluded)
+4. **Response Generation**: Grok (primary) or GPT-5.2 (fallback) generates in-character response with identity, user profiles, chat summary, and intent system
+5. **Tool Use**: Bot can call internet search (DuckDuckGo) mid-response if needed
+6. **Reaction Parsing**: `[REACTION:emoji]` tags are extracted and applied as message reactions
+7. **History Update**: User message + bot response saved to `last_50.json`
 
-### Two-Step AI Process
+### AI Models Used
 
-The bot uses a two-step AI process for better quality:
-- **Grok API** (grok-4): Generates initial response based on character
-- **OpenAI API** (gpt-4o): Validates and refines the response to make it more unique and ensure it matches Krapral's character perfectly
+| Model | Purpose | Frequency |
+|-------|---------|-----------|
+| **Grok grok-4-1-fast-non-reasoning** (primary) | Main response generation | Per reply |
+| **GPT-5.2** (fallback) | Main response fallback | On Grok failure |
+| **Grok grok-4-1-fast-non-reasoning** (primary) | Poll analysis & commentary | Once per poll (3+ votes) |
+| **GPT-5.2** (fallback) | Poll analysis fallback | On Grok failure |
+| **GPT-4o-mini** | Context gatekeeper ("should I reply?") | Per untagged message batch |
+| **GPT-4o** | Rolling chat summary | Every 10 messages |
+| **Whisper-1** | Audio/voice transcription | Per audio/video message |
+
+### Media Processing
+
+- **Voice/Audio**: Downloaded → Whisper transcription → processed as text
+- **Video**: Downloaded → FFmpeg extracts 3 frames (10%, 50%, 90%) + audio transcription
+- **Photos**: Caption extracted, image marked as placeholder
 
 ## Key Features Explained
 
@@ -233,13 +206,12 @@ The bot uses a two-step AI process for better quality:
 Every user and bot is identified with @ symbol:
 - `@FedotovAndrii` ✅
 - `@vinohradov` ✅
-- `@babushkaTania_bot` ✅
 - `FedotovAndrii` ❌ (missing @)
 - User IDs ❌ (never used)
 
-### Message Format for Grok API
+### Message Format
 
-Messages are sent in OpenAI format with `name` field:
+Messages are sent in OpenAI chat format with `name` field:
 
 ```json
 {
@@ -257,46 +229,30 @@ Messages are sent in OpenAI format with `name` field:
 }
 ```
 
-### Unknown Bot/User Handling
+### Intent System
 
-Any bot or user NOT listed in `users.json`:
+Each response gets a random intent to vary behavior:
+`tease`, `joke`, `react_short`, `react_deep`, `support_light`, `shift_topic`, `escalate_playfully`, `observe_silently`, `do_not_reply`
+
+### Unknown User Handling
+
+Any user NOT listed in `users.json`:
 - Automatically gets rank "рядовой срочной службы"
 - Receives full Krapral treatment (подколы, приказы, братская любовь)
-- Addressed as `@theirusername` (e.g., "Рядовой @SomeRandomBot")
-
-### Message History Format
-
-Messages are stored in OpenAI format with name fields:
-
-```json
-{
-  "role": "user",
-  "name": "@FedotovAndrii",
-  "content": "Привет, Крапрал!"
-}
-```
-
-```json
-{
-  "role": "assistant",
-  "name": "@Krapral",
-  "content": "Так точно, боец!"
-}
-```
+- Addressed as `@theirusername`
 
 ## Troubleshooting
 
 ### Bot not responding
 
 1. Check logs: `pm2 logs krapral-bot` or check console output
-2. Verify `.env` file has correct `TELEGRAM_TOKEN` and `GROK_API_KEY`
+2. Verify `.env` file has correct `TELEGRAM_TOKEN` and `OPENAI_API_KEY`
 3. Check that `identity.txt` and `users.json` exist and are readable
 
 ### API Errors
 
-- **429 (Rate Limit)**: Bot automatically retries with exponential backoff
-- **500 (Server Error)**: Bot retries up to 3 times, then falls back to grok-3
 - Check logs for detailed error messages
+- OpenAI errors are caught and logged via pino
 
 ### History not persisting
 
@@ -306,8 +262,3 @@ Messages are stored in OpenAI format with name fields:
 ## License
 
 ISC
-
-## Support
-
-For issues or questions, check the logs first. The bot uses pino for structured logging with pretty-printed output in development.
-

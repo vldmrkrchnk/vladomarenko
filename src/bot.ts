@@ -24,10 +24,14 @@ const logger = pino({
 
 const TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_KEY = process.env.OPENAI_API_KEY!;
+const GROK_KEY = process.env.GROK_API_KEY!;
 const IDENTITY = fs.readFileSync('identity.txt', 'utf-8');
 
 // Initialize OpenAI
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
+
+// Initialize Grok (OpenAI-compatible API)
+const grok = new OpenAI({ baseURL: 'https://api.x.ai/v1', apiKey: GROK_KEY });
 
 // Interfaces
 interface UserProfile {
@@ -73,6 +77,17 @@ const HISTORY_FILE = 'last_50.json';
 const USERS_FILE = 'users.json';
 const DEBOUNCE_DELAY = 4000;
 const processedMessageIds = new Set<number>();
+const MAX_PROCESSED_IDS = 5000;
+
+function pruneProcessedIds() {
+	if (processedMessageIds.size > MAX_PROCESSED_IDS) {
+		const idsArray = Array.from(processedMessageIds);
+		const toRemove = idsArray.slice(0, idsArray.length - MAX_PROCESSED_IDS);
+		for (const id of toRemove) processedMessageIds.delete(id);
+		logger.info(`[CLEANUP] Pruned processedMessageIds from ${idsArray.length} to ${processedMessageIds.size}`);
+	}
+}
+setInterval(pruneProcessedIds, 60 * 60 * 1000); // Prune every hour
 
 // Poll State
 const activePolls = new Map<string, PollData>();
@@ -226,7 +241,7 @@ Reply "YES" if he should speak. "NO" if he should stay silent.
 
 	try {
 		const completion = await openai.chat.completions.create({
-			model: 'gpt-5.2',
+			model: 'gpt-4o-mini',
 			messages: [{ role: 'user', content: prompt }],
 			temperature: 0.1, // Low temp for decision making
 			max_completion_tokens: 5
@@ -284,12 +299,25 @@ RULES:
 - NO COMMANDS. NO NUMBERS. JUST COMMENTARY.
 `;
 
-			const completion = await openai.chat.completions.create({
-				model: 'gpt-5.2',
-				messages: [{ role: 'system', content: systemPrompt }],
-				response_format: { type: 'json_object' },
-				max_completion_tokens: 150
-			});
+			const pollMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }];
+			let completion;
+			try {
+				completion = await grok.chat.completions.create({
+					model: 'grok-4-1-fast-non-reasoning',
+					messages: pollMessages,
+					response_format: { type: 'json_object' },
+					max_completion_tokens: 150
+				});
+				logger.info('[POLL AI] Grok response generated');
+			} catch (grokErr: any) {
+				logger.warn({ error: grokErr.message }, '[POLL AI] Grok failed, falling back to OpenAI');
+				completion = await openai.chat.completions.create({
+					model: 'gpt-5.2',
+					messages: pollMessages,
+					response_format: { type: 'json_object' },
+					max_completion_tokens: 150
+				});
+			}
 
 			const result = JSON.parse(completion.choices[0].message.content || '{}');
 			if (result.action && result.action !== 'SILENT' && result.message) {
@@ -303,16 +331,22 @@ RULES:
 			}
 		} catch (e) {
 			logger.error({ error: e }, 'Poll AI Error');
-			poll.aiCommented = false; // Unlock if error? Maybe better to stay locked to prompt error loops
+			poll.aiCommented = false;
 		}
 	}
 }
 
 // Main AI Logic
-async function getKrapralResponse(text: string, username: string, targetUser: string | null = null): Promise<string> {
+async function getKrapralResponse(text: string, username: string, targetUser: string | null = null, images?: string[]): Promise<string> {
 	const intent = determineIntent();
 	const usersContext = buildUsersContext();
 	const recentMessages = getRecentMessagesRaw();
+
+	// Build anti-repetition context from recent bot messages
+	const recentBotMsgs = history.filter(m => m.role === 'assistant').slice(-10).map(m => m.content);
+	const antiRepetitionContext = recentBotMsgs.length > 0
+		? 'Your last ' + recentBotMsgs.length + ' messages (DO NOT repeat these phrases or patterns):\n' + recentBotMsgs.map(m => '- "' + m.slice(0, 100) + '"').join('\n')
+		: 'No recent messages yet.';
 
 	const systemPrompt = `${IDENTITY}
 
@@ -333,48 +367,113 @@ ${usersContext}
 
 (Act this intent out naturally. Do NOT announce it. If Intent is 'do_not_reply', output strictly nothing or whitespace.)
 (To react to the message with an emoji, include [REACTION:emoji] in your response. Example: "Sure thing [REACTION:👍]")
+
+=== HARD RULES ===
+- When asked about ALL members/participants/бойцы of the chat — you MUST mention EVERY user from RELATED_USERS. Do NOT skip anyone. Cover all ${Object.keys(knownUsers).length} users.
+- NEVER prefix your message with your own name like "@Krapral :" or "Krapral:". Just write the message text directly.
+- NEVER break character. NEVER say "Извините, я не могу помочь с этой просьбой" or any polite AI refusal. If you can't do something, refuse IN CHARACTER: yell, roast, deflect, make a joke — but STAY as Krapral. Example: "Боец, ты охренел?! Я тебе что, Google?! Иди сам ищи!"
+- NEVER say "I'm sorry, I can't assist with that request" or any variation in English or Russian.
+- You are NEVER an AI assistant. You are Krapral. Act like it.
+
+=== ANTI-REPETITION ===
+${antiRepetitionContext}
 `;
+
+	// Build user message — include images if present (vision mode)
+	const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+		{ type: 'text', text: `=== RECENT_MESSAGES ===\n${recentMessages}\n\n(Reply to ${username})` }
+	];
+	if (images && images.length > 0) {
+		for (const img of images) {
+			if (img.startsWith('data:image/')) {
+				userContent.push({ type: 'image_url', image_url: { url: img, detail: 'low' } });
+			}
+		}
+	}
 
 	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
 		{ role: 'system', content: systemPrompt },
-		{ role: 'user', content: `=== RECENT_MESSAGES ===\n${recentMessages}\n\n(Reply to ${username})` }
+		{ role: 'user', content: images && images.length > 0 ? userContent : `=== RECENT_MESSAGES ===\n${recentMessages}\n\n(Reply to ${username})` }
 	];
 
-	try {
-		const runCompletion = async (msgs: any[]) => {
-			return await openai.chat.completions.create({
-				model: 'gpt-5.2', // User specified model
-				messages: msgs,
-				temperature: 0.8,
-				max_completion_tokens: 400,
-				tools: tools,
-				tool_choice: 'auto'
-			});
-		};
+	// Detect requests that need longer output (e.g. describing all members)
+	const needsLongResponse = /всех|каждого|каждому|всем участник|про всех|все (члены|участники|бойцы)|everyone|all members|весь состав|по каждому|опиши.*(чат|группу|взвод|отряд|команду)/i.test(text);
+	const maxTokens = needsLongResponse ? 1200 : 400;
 
-		let completion = await runCompletion(messages);
-		let responseMessage = completion.choices[0].message;
+	const runCompletion = async (client: OpenAI, model: string, msgs: any[]) => {
+		return await client.chat.completions.create({
+			model,
+			messages: msgs,
+			temperature: 0.8,
+			max_completion_tokens: maxTokens,
+			tools: tools,
+			tool_choice: 'auto'
+		});
+	};
 
-		// Handle Tools
+	const handleToolCalls = async (client: OpenAI, model: string, msgs: any[], responseMessage: any) => {
 		if (responseMessage.tool_calls) {
-			logger.info(`[OPENAI] Tool calls: ${responseMessage.tool_calls.length}`);
-			messages.push(responseMessage);
+			logger.info(`[AI] Tool calls: ${responseMessage.tool_calls.length}`);
+			msgs.push(responseMessage);
 			for (const toolCall of responseMessage.tool_calls) {
 				if (toolCall.function.name === 'search_internet') {
 					const args = JSON.parse(toolCall.function.arguments);
 					const toolResult = await performSearch(args.query);
-					messages.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
+					msgs.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
 				}
 			}
-			completion = await runCompletion(messages);
-			responseMessage = completion.choices[0].message;
+			const completion = await runCompletion(client, model, msgs);
+			return completion.choices[0].message;
 		}
+		return responseMessage;
+	};
 
-		let response = responseMessage.content?.trim() || '';
-		response = response.replace(/^((Bot|AI|Krapral):)/i, '').trim();
+	const postProcess = (response: string): string => {
+		// Strip self-referencing prefixes: "@Krapral :", "Krapral:", "Bot:", "AI:", recursive variants
+		response = response.replace(/^((@?Krapral|@?Крапрал|Bot|AI)\s*:\s*)+/gi, '').trim();
+
+		// Catch generic AI refusals that break character
+		const refusalPatterns = [
+			/^извините?,?\s*(я\s+)?не\s+могу\s+(помочь|с этим)/i,
+			/^I'?m sorry,?\s*(but\s+)?I\s+can'?t\s+(assist|help)/i,
+			/^мне\s+очень\s+жаль/i,
+			/^sorry,?\s+I\s+can/i,
+		];
+		if (refusalPatterns.some(p => p.test(response))) {
+			logger.warn(`[REFUSAL CAUGHT] "${response.slice(0, 80)}" — replacing with in-character deflection`);
+			const deflections = [
+				'Боец, ты чего несёшь?! Отставить бредовые запросы! Давай по делу!',
+				'ЭЙ! Крапрал таким не занимается! Лучше отжимайся — 20 раз, ЖИВО!',
+				'Рядовой, я тебе что, справочная?! Сам думай, голова не только для берета!',
+				'ОТСТАВИТЬ! Такие вопросы — это как граната без чеки. Давай что-нибудь поумнее!',
+				'Хах, ну ты даёшь, боец! Нет. Следующий вопрос!',
+			];
+			response = deflections[Math.floor(Math.random() * deflections.length)];
+		}
+		return response;
+	};
+
+	// Primary: Grok
+	try {
+		let completion = await runCompletion(grok, 'grok-4-1-fast-non-reasoning', [...messages]);
+		let responseMessage = await handleToolCalls(grok, 'grok-4-1-fast-non-reasoning', messages, completion.choices[0].message);
+		let response = postProcess(responseMessage.content?.trim() || '');
+		if (response) {
+			logger.info('[GROK] Response generated successfully');
+			return response;
+		}
+	} catch (err: any) {
+		logger.warn({ error: err.message }, '[GROK] Failed, falling back to OpenAI');
+	}
+
+	// Fallback: OpenAI
+	try {
+		let completion = await runCompletion(openai, 'gpt-5.2', [...messages]);
+		let responseMessage = await handleToolCalls(openai, 'gpt-5.2', messages, completion.choices[0].message);
+		let response = postProcess(responseMessage.content?.trim() || '');
 		return response;
 	} catch (err: any) {
-		logger.error({ error: err }, 'OpenAI API Error');
+		logger.error({ error: err }, 'OpenAI API Error (fallback)');
 		return '... (задумался)';
 	}
 }
@@ -450,12 +549,16 @@ async function processAccumulatedMessages() {
 		}
 	}
 
+	const isPrivateChat = lastMsg.ctx.chat?.type === 'private';
 	const triggers = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб'];
 	const isMentioned = triggers.some(t => fullText.toLowerCase().includes(t)) || (lastMsg.ctx.message.reply_to_message?.from?.is_bot);
 	const isQuietHours = new Date().getHours() >= 2 && new Date().getHours() < 7;
 
-	let shouldReply = isMentioned || isAnsweringBot;
-	// 3. AI Gatekeeper for Context
+	// DMs always get a reply — no gatekeeper needed
+	// Direct mentions and answers to bot questions ALWAYS get a reply, even during quiet hours
+	let shouldReply = isPrivateChat || isMentioned || isAnsweringBot;
+
+	// 3. AI Gatekeeper for Context (skip during quiet hours)
 	// If not directly mentioned, ask the AI if it should reply based on context.
 	if (!shouldReply && !isQuietHours) {
 		try {
@@ -477,7 +580,9 @@ async function processAccumulatedMessages() {
 	// 4. Reply
 	if (shouldReply) {
 		const targetUser = lastMsg.user;
-		let response = await getKrapralResponse(fullText, lastMsg.user, targetUser);
+		// Collect all images from the batch
+		const batchImages = batch.flatMap(m => m.images || []).filter(img => img.startsWith('data:image/'));
+		let response = await getKrapralResponse(fullText, lastMsg.user, targetUser, batchImages.length > 0 ? batchImages : undefined);
 
 		// Parse [REACTION:Emoji] tag
 		const reactionMatch = response.match(/\[REACTION:\s*(.+?)\s*\]/);
@@ -526,6 +631,43 @@ bot.on('photo', async (ctx) => {
 
 	logger.info(`[PHOTO] ${username}`);
 	await enqueueMessage(ctx, caption, username, messageId, ['(photo_placeholder)']);
+});
+
+// Handler: Sticker
+bot.on('sticker', async (ctx) => {
+	const user = ctx.from;
+	const username = formatName(user);
+	const messageId = ctx.message.message_id;
+
+	if (processedMessageIds.has(messageId)) return;
+	processedMessageIds.add(messageId);
+
+	const emoji = ctx.message.sticker.emoji || '';
+	const setName = ctx.message.sticker.set_name || '';
+	logger.info(`[STICKER] ${username}: ${emoji} (${setName})`);
+	await enqueueMessage(ctx, `[STICKER: ${emoji}]`, username, messageId);
+});
+
+// Handler: Forwarded messages (add context about forwarding)
+bot.on('message', async (ctx, next) => {
+	const msg = ctx.message as any;
+	if (msg.forward_origin || msg.forward_from || msg.forward_from_chat) {
+		const user = ctx.from;
+		const username = formatName(user);
+		const messageId = msg.message_id;
+
+		if (processedMessageIds.has(messageId)) return;
+		processedMessageIds.add(messageId);
+
+		const forwardFrom = msg.forward_from?.username
+			? `@${msg.forward_from.username}`
+			: msg.forward_from_chat?.title || 'unknown';
+		const text = msg.text || msg.caption || '';
+		logger.info(`[FORWARD] ${username} forwarded from ${forwardFrom}`);
+		await enqueueMessage(ctx, `[FORWARDED from ${forwardFrom}] ${text}`, username, messageId);
+		return; // Don't pass to next handlers
+	}
+	return next();
 });
 
 // Video Processing

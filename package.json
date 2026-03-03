@@ -5,6 +5,7 @@
   "main": "dist/bot.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/bot.ts",
+    "dev:local": "DOTENV_CONFIG_PATH=.env.local ts-node-dev --respawn --transpile-only src/bot.ts",
     "dev:grok": "FORCE_API=grok ts-node-dev --respawn --transpile-only src/bot.ts",
     "dev:openai": "FORCE_API=openai ts-node-dev --respawn --transpile-only src/bot.ts",
     "build": "tsc",
