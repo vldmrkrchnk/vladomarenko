@@ -273,12 +273,24 @@ function cleanBotPrefix(text: string): string {
 	return text.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '').trim();
 }
 
+// Strip trigger words from user messages before sending to the model.
+// Users prefix messages with "крапрал" to address the bot — the model doesn't need to see this,
+// and repeated trigger words across messages can make Grok think the user is "repeating themselves".
+const TRIGGER_STRIP_PATTERN = /^[@]?(капрал|крапрал|krapral|краб|крабчик|крамар)[,;:!.\s]*/gi;
+function stripTriggerWords(text: string): string {
+	return text.replace(TRIGGER_STRIP_PATTERN, '').trim() || text;
+}
+
 // Grok streaming response
 async function getKrapralStream(text: string, username: string) {
 	const messages = [
 		{ role: 'system' as const, content: IDENTITY },
-		...history.map(m => ({ role: m.role as 'user' | 'assistant', name: m.name, content: m.content })),
-		{ role: 'user' as const, name: username, content: text }
+		...history.map(m => ({
+			role: m.role as 'user' | 'assistant',
+			name: m.name,
+			content: m.role === 'user' ? stripTriggerWords(m.content) : m.content
+		})),
+		{ role: 'user' as const, name: username, content: stripTriggerWords(text) }
 	];
 
 	const typedMessages = messages.map(m => ({
