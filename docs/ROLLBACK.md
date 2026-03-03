@@ -4,7 +4,7 @@
 
 | Version | Git Commit | Image Digest | Description | Deployed |
 |---------|-----------|-------------|-------------|----------|
-| **v3.2 (current)** | `bb36104` | *pending deploy* | Bug fixes, reaction-only mode, sticker handler, reply-to context, GCS optimization | 2026-03-03 |
+| **v3.2 (current)** | `bb36104` | `33fb7406a4de` | Bug fixes, reaction-only mode, sticker handler, reply-to context, GCS optimization | 2026-03-03 |
 | **v3.1 (previous)** | `af20ca5` | `41210d081a98` | Grok primary + OpenAI fallback | 2026-03-03 |
 | **v3.0** | — | `81a1c840a32b` | Last deploy before Grok (OpenAI-only) | 2026-01-22 |
 | **new-branch-release** | — | `167e0f23051e` | — | 2026-01-16 |
