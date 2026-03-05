@@ -1,0 +1,19 @@
+{
+  "description": "User asks about current events (Iran/USA war). Bot should search the web and provide fresh info in character.",
+  "history": [
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: пацаны видели новость про иран?", "timestamp": 1709660000000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: не, а что там?", "timestamp": 1709660060000 }
+  ],
+  "incoming": {
+    "from": { "id": 456, "username": "nehoroshevVl", "first_name": "Вован" },
+    "text": "крапрал что там с войной сша и ирана",
+    "message_id": 70008,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "web_search": true,
+    "address_user": "Вован",
+    "notes": "Bot should use web search results to provide current info about Iran/USA, commented in Krapral's military style. Should NOT give outdated/hallucinated info."
+  }
+}

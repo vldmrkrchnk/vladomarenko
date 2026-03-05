@@ -1,16 +1,14 @@
 /**
- * Test runner for Krapral bot scenarios.
- * Sends each scenario to Grok API and displays response vs expected behavior.
+ * Run all test scenarios and save results tagged with current git commit hash.
  *
  * Usage:
- *   npx ts-node --transpile-only test-scenarios/run-tests.ts [scenario-number]
+ *   npx ts-node --transpile-only test-scenarios/save-results.ts
  *
- * Examples:
- *   npx ts-node --transpile-only test-scenarios/run-tests.ts        # run all
- *   npx ts-node --transpile-only test-scenarios/run-tests.ts 3      # run only 03-*
+ * Results are saved to: test-scenarios/results/<commit-hash>.json
  */
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import OpenAI from 'openai';
 import axios from 'axios';
 import 'dotenv/config';
@@ -19,22 +17,19 @@ const GROK_KEY = process.env.GROK_API_KEY!;
 const GROK_MODEL = process.env.GROK_MODEL || 'grok-4-1-fast-non-reasoning';
 
 if (!GROK_KEY) {
-	console.error('ERROR: GROK_API_KEY not set. Use .env or .env.local');
+	console.error('ERROR: GROK_API_KEY not set');
 	process.exit(1);
 }
 
 const grok = new OpenAI({ apiKey: GROK_KEY, baseURL: 'https://api.x.ai/v1' });
 
-// Load identity (same logic as bot.ts)
 const RAW_IDENTITY = fs.readFileSync(path.join(process.cwd(), 'identity.txt'), 'utf-8');
 const USERS_FILE = path.join(process.cwd(), 'users.json');
 const USERS_JSON = fs.existsSync(USERS_FILE) ? fs.readFileSync(USERS_FILE, 'utf-8') : '{}';
-const IDENTITY = RAW_IDENTITY.replace(
-	/\[ВСТАВЬ СЮДА ВЕСЬ ТВОЙ JSON ИЗ ПЕРВОГО СООБЩЕНИЯ\]/,
-	USERS_JSON
-);
+const IDENTITY = RAW_IDENTITY.replace(/\[ВСТАВЬ СЮДА ВЕСЬ ТВОЙ JSON ИЗ ПЕРВОГО СООБЩЕНИЯ\]/, USERS_JSON);
 
-// Replicate bot logic
+// --- Replicated bot logic ---
+
 function cleanBotPrefix(text: string): string {
 	return text
 		.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '')
@@ -47,7 +42,14 @@ function stripTriggerWords(text: string): string {
 	return text.replace(TRIGGER_STRIP_PATTERN, '').trim() || text;
 }
 
-// Web search & URL fetching (replicated from bot.ts)
+function shouldSkipAsBriefOutburst(text: string): boolean {
+	const lower = text.toLowerCase();
+	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
+	if (KRAPRAL_TRIGGERS.some(t => lower.includes(t))) return false;
+	const words = text.trim().split(/\s+/);
+	return words.length < 5 && !lower.includes('?');
+}
+
 const NEWS_KEYWORDS = /(новост|что происход|что случил|войн[аеуыоёй]|конфликт|обстрел|удар[аеи]|бомб|санкци|переговор|атак[аеуио]|наступлен|операци|фронт|ситуаци[яи]|что там с|что нового|последн|свеж|сегодня|сейчас|обстановк)/i;
 const URL_PATTERN = /https?:\/\/[^\s<>\"']+/gi;
 
@@ -58,7 +60,7 @@ async function webSearch(query: string): Promise<string> {
 			headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
 			timeout: 5000
 		});
-		const matches = resp.data.match(/<a class="result__snippet"[^>]*>(.*?)<\/a>/gs);
+		const matches = resp.data.match(/<a class="result__snippet"[^>]*>[\s\S]*?<\/a>/g);
 		if (!matches || matches.length === 0) return '(no results found)';
 		return matches.slice(0, 5).map((m: string, i: number) => {
 			const text = m.replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&').trim();
@@ -110,59 +112,57 @@ async function getWebContext(text: string): Promise<string | null> {
 	return parts.length > 0 ? parts.join('\n\n') : null;
 }
 
-function shouldSkipAsBriefOutburst(text: string): boolean {
-	const lower = text.toLowerCase();
-	const KRAPRAL_TRIGGERS = ["капрал", 'крапрал', 'krapral', '@krapral', 'краб', "крабчик", "крамар"];
-	if (KRAPRAL_TRIGGERS.some(t => lower.includes(t))) return false; // direct ping always passes
-	const words = text.trim().split(/\s+/);
-	return words.length < 5 && !lower.includes('?');
+// --- Run scenario ---
+
+interface ScenarioResult {
+	scenario: string;
+	description: string;
+	incoming_text: string;
+	incoming_user: string;
+	should_reply: boolean;
+	blocked_by_filter: boolean;
+	web_context: string | null;
+	raw_response: string | null;
+	cleaned_response: string | null;
+	checks: Record<string, boolean | string>;
 }
 
-// Colors for terminal
-const C = {
-	reset: '\x1b[0m',
-	bright: '\x1b[1m',
-	dim: '\x1b[2m',
-	green: '\x1b[32m',
-	yellow: '\x1b[33m',
-	blue: '\x1b[34m',
-	magenta: '\x1b[35m',
-	cyan: '\x1b[36m',
-	red: '\x1b[31m',
-	bg: '\x1b[44m',
-};
-
-async function runScenario(filePath: string) {
+async function runScenario(filePath: string): Promise<ScenarioResult> {
 	const scenario = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 	const name = path.basename(filePath, '.json');
-
-	console.log(`\n${C.bg}${C.bright} SCENARIO: ${name} ${C.reset}`);
-	console.log(`${C.dim}${scenario.description}${C.reset}\n`);
-
-	// Check shouldReply logic
 	const incoming = scenario.incoming;
-	const briefOutburst = shouldSkipAsBriefOutburst(incoming.text);
 	const expected = scenario.expected_behavior;
 
+	const result: ScenarioResult = {
+		scenario: name,
+		description: scenario.description,
+		incoming_text: incoming.text,
+		incoming_user: `${incoming.from.first_name} (@${incoming.from.username})`,
+		should_reply: expected.should_reply !== false,
+		blocked_by_filter: false,
+		web_context: null,
+		raw_response: null,
+		cleaned_response: null,
+		checks: {}
+	};
+
+	console.log(`  Running ${name}...`);
+
+	// Check brief outburst filter
 	if (expected.should_reply === false) {
-		console.log(`${C.yellow}Expected: should NOT reply${C.reset}`);
-		console.log(`${C.cyan}Brief outburst filter: ${briefOutburst ? 'BLOCKED (correct)' : 'PASSED (would reply)'}${C.reset}`);
-		if (briefOutburst) {
-			console.log(`${C.green}PASS — message correctly filtered out${C.reset}`);
-		} else {
-			console.log(`${C.red}NOTE — filter did not block, but other rules (cooldown etc.) may still prevent reply${C.reset}`);
-		}
-		console.log(`${C.dim}─────────────────────────────────────────${C.reset}`);
-		return;
+		result.blocked_by_filter = shouldSkipAsBriefOutburst(incoming.text);
+		result.checks['brief_outburst_blocked'] = result.blocked_by_filter;
+		return result;
 	}
 
-	// Build messages for Grok (same as bot.ts getKrapralStream)
+	// Build messages
 	const displayName = incoming.from.first_name;
 	const username = `@${incoming.from.username}`;
 	const displayLabel = displayName ? `[${displayName} (${username})]` : `[${username}]`;
 
-	// Fetch web context if needed
 	const webContext = await getWebContext(incoming.text);
+	result.web_context = webContext ? webContext.substring(0, 500) : null;
+
 	const userContent = `${displayLabel}: ${stripTriggerWords(incoming.text)}`;
 	const enrichedContent = webContext
 		? `${userContent}\n\n--- АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА (используй для ответа, но отвечай в своём стиле) ---\n${webContext}`
@@ -175,32 +175,18 @@ async function runScenario(filePath: string) {
 			name: m.name?.replace(/[^a-zA-Z0-9_-]/g, '_'),
 			content: m.role === 'user' ? stripTriggerWords(m.content) : m.content
 		})),
-		{
-			role: 'user',
-			name: username.replace(/[^a-zA-Z0-9_-]/g, '_'),
-			content: enrichedContent
-		}
+		{ role: 'user', name: username.replace(/[^a-zA-Z0-9_-]/g, '_'), content: enrichedContent }
 	];
 
-	// Show what we're sending
-	console.log(`${C.magenta}Incoming:${C.reset} ${displayLabel}: "${incoming.text}"`);
-	console.log(`${C.magenta}History:${C.reset} ${(scenario.history || []).length} messages`);
-	if (webContext) {
-		console.log(`${C.cyan}Web context:${C.reset} ${webContext.substring(0, 200)}...`);
-	}
-
-	// For prefix-stripping test, show unit test results
+	// Prefix stripping unit tests
 	if (scenario.simulated_raw_responses) {
-		console.log(`\n${C.cyan}Prefix stripping unit tests:${C.reset}`);
 		for (const raw of scenario.simulated_raw_responses) {
 			const cleaned = cleanBotPrefix(raw);
 			const passed = !cleaned.match(/^@?[Кк]р[аa]пр[аa]л/i) && !cleaned.match(/^@?[Kk]rapral/i);
-			console.log(`  "${raw}" → "${cleaned}" ${passed ? C.green + 'PASS' : C.red + 'FAIL'}${C.reset}`);
+			result.checks[`prefix_strip: "${raw}"`] = passed ? 'PASS' : 'FAIL';
 		}
 	}
 
-	// Call Grok API
-	console.log(`\n${C.cyan}Calling Grok (${GROK_MODEL})...${C.reset}`);
 	try {
 		const completion = await grok.chat.completions.create({
 			model: GROK_MODEL,
@@ -211,74 +197,104 @@ async function runScenario(filePath: string) {
 
 		const raw = completion.choices[0]?.message?.content || '(empty)';
 		const cleaned = cleanBotPrefix(raw);
+		result.raw_response = raw;
+		result.cleaned_response = cleaned;
 
-		console.log('');
-		console.log(`${C.green}${C.bright}╔══════════════════════════════════════════════════════╗${C.reset}`);
-		console.log(`${C.green}${C.bright}║  BOT REPLY:${C.reset}`);
-		console.log(`${C.green}${C.bright}║${C.reset}  ${cleaned}`);
-		if (raw !== cleaned) {
-			console.log(`${C.green}${C.bright}║${C.reset}  ${C.dim}(raw: ${raw})${C.reset}`);
-		}
-		console.log(`${C.green}${C.bright}╚══════════════════════════════════════════════════════╝${C.reset}`);
-		console.log('');
-
-		// Automated checks
-		console.log(`\n${C.yellow}Checks:${C.reset}`);
-
-		// Check self-prefix
+		// Auto checks
 		const hasPrefix = /^@?[Кк]р[аa]пр[аa]л/i.test(cleaned) || /^@?[Kk]rapral/i.test(cleaned);
-		console.log(`  Self-prefix stripped: ${hasPrefix ? C.red + 'FAIL' : C.green + 'PASS'}${C.reset}`);
+		result.checks['no_self_prefix'] = !hasPrefix;
 
-		// Check wrong username
 		if (expected.should_NOT_address) {
-			const wrongAddr = cleaned.includes(expected.should_NOT_address);
-			console.log(`  Not addressing ${expected.should_NOT_address}: ${wrongAddr ? C.red + 'FAIL' : C.green + 'PASS'}${C.reset}`);
-		}
-
-		// Check must_NOT_do
-		if (expected.must_NOT_do) {
-			for (const rule of expected.must_NOT_do) {
-				console.log(`  ${C.dim}Must NOT: ${rule}${C.reset} — ${C.yellow}(manual check)${C.reset}`);
-			}
-		}
-
-		// Show expected for manual review
-		console.log(`\n${C.yellow}Expected behavior:${C.reset}`);
-		for (const [key, val] of Object.entries(expected)) {
-			if (key === 'must_NOT_do' || key === 'example_responses') continue;
-			console.log(`  ${C.dim}${key}:${C.reset} ${typeof val === 'string' ? val : JSON.stringify(val)}`);
+			result.checks[`not_addressing_${expected.should_NOT_address}`] = !cleaned.includes(expected.should_NOT_address);
 		}
 	} catch (err: any) {
-		console.log(`${C.red}API Error: ${err.message}${C.reset}`);
+		result.checks['api_error'] = err.message;
 	}
 
-	console.log(`${C.dim}─────────────────────────────────────────${C.reset}`);
+	return result;
 }
 
 async function main() {
-	const filterNum = process.argv[2]; // optional: run only scenario N
+	// Get git info
+	let commitHash: string;
+	let commitMsg: string;
+	let branch: string;
+	try {
+		commitHash = execSync('git rev-parse --short HEAD').toString().trim();
+		commitMsg = execSync('git log -1 --pretty=%s').toString().trim();
+		branch = execSync('git rev-parse --abbrev-ref HEAD').toString().trim();
+	} catch {
+		console.error('ERROR: Not a git repository or git not available');
+		process.exit(1);
+	}
+
+	const isDirty = execSync('git status --porcelain').toString().trim().length > 0;
+	const tag = isDirty ? `${commitHash}-dirty` : commitHash;
+
+	console.log(`\nKrapral Test Results — ${tag} (${branch})`);
+	console.log(`Commit: ${commitMsg}`);
+	if (isDirty) console.log('WARNING: Working tree has uncommitted changes');
+	console.log(`Model: ${GROK_MODEL}\n`);
+
+	// Find and run scenarios
 	const scenarioDir = path.join(process.cwd(), 'test-scenarios');
 	const files = fs.readdirSync(scenarioDir)
 		.filter(f => f.match(/^\d+-.+\.json$/))
 		.sort();
 
-	if (files.length === 0) {
-		console.error('No scenario files found!');
-		process.exit(1);
+	const results: ScenarioResult[] = [];
+	for (const file of files) {
+		const result = await runScenario(path.join(scenarioDir, file));
+		results.push(result);
 	}
 
-	const filtered = filterNum
-		? files.filter(f => f.startsWith(filterNum.padStart(2, '0')))
-		: files;
+	// Save results
+	const resultsDir = path.join(scenarioDir, 'results');
+	if (!fs.existsSync(resultsDir)) fs.mkdirSync(resultsDir, { recursive: true });
 
-	console.log(`${C.bright}Krapral Bot Test Runner${C.reset}`);
-	console.log(`${C.dim}Scenarios: ${filtered.length}/${files.length} | Model: ${GROK_MODEL}${C.reset}`);
+	const output = {
+		commit: commitHash,
+		commit_message: commitMsg,
+		branch,
+		dirty: isDirty,
+		model: GROK_MODEL,
+		timestamp: new Date().toISOString(),
+		scenarios: results
+	};
 
-	for (const file of filtered) {
-		await runScenario(path.join(scenarioDir, file));
+	const outFile = path.join(resultsDir, `${tag}.json`);
+	fs.writeFileSync(outFile, JSON.stringify(output, null, 2));
+
+	// Print summary
+	console.log('\n═══════════════════════════════════════');
+	console.log('  RESULTS SUMMARY');
+	console.log('═══════════════════════════════════════\n');
+
+	for (const r of results) {
+		const status = r.blocked_by_filter
+			? '🔇 BLOCKED'
+			: r.cleaned_response
+				? '💬 REPLIED'
+				: '❌ ERROR';
+
+		console.log(`${r.scenario}: ${status}`);
+		if (r.cleaned_response) {
+			console.log(`  → ${r.cleaned_response.substring(0, 120)}${r.cleaned_response.length > 120 ? '...' : ''}`);
+		}
+		if (r.web_context) {
+			console.log(`  🌐 Web context used`);
+		}
+
+		const failedChecks = Object.entries(r.checks).filter(([, v]) => v === false || v === 'FAIL');
+		if (failedChecks.length > 0) {
+			for (const [check] of failedChecks) {
+				console.log(`  ❌ FAIL: ${check}`);
+			}
+		}
+		console.log('');
 	}
 
-	console.log(`\n${C.bright}Done!${C.reset}`);
+	console.log(`Saved to: ${outFile}`);
 }
 
 main().catch(err => {

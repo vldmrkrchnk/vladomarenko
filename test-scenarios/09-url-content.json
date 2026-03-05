@@ -1,0 +1,18 @@
+{
+  "description": "User shares a URL. Bot should fetch page content and comment on it in character.",
+  "history": [
+    { "role": "user", "name": "@vinograd1ka", "content": "[Виноградик (@vinograd1ka)]: смотрите что нашел", "timestamp": 1709670000000 }
+  ],
+  "incoming": {
+    "from": { "id": 321, "username": "vinograd1ka", "first_name": "Виноградик" },
+    "text": "крапрал глянь https://en.wikipedia.org/wiki/Neon_Genesis_Evangelion",
+    "message_id": 70009,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "url_fetch": true,
+    "address_user": "Виноградик or @vinograd1ka",
+    "notes": "Bot should fetch the URL, understand it's about an anime, and comment on it in Krapral's style. Should NOT just repeat the URL text."
+  }
+}

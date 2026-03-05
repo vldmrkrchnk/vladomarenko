@@ -299,6 +299,122 @@ function cleanBotPrefix(text: string): string {
 		.trim();
 }
 
+// === WEB SEARCH & URL FETCHING ===
+
+// Detect if message needs live web context
+const NEWS_KEYWORDS = /(новост|что происход|что случил|войн[аеуыоёй]|конфликт|обстрел|удар[аеи]|бомб|санкци|переговор|атак[аеуио]|наступлен|операци|фронт|ситуаци[яи]|что там с|что нового|последн|свеж|сегодня|сейчас|обстановк)/i;
+const URL_PATTERN = /https?:\/\/[^\s<>\"']+/gi;
+
+function needsWebSearch(text: string): boolean {
+	return NEWS_KEYWORDS.test(text);
+}
+
+function extractUrls(text: string): string[] {
+	return text.match(URL_PATTERN) || [];
+}
+
+// Search the web using DuckDuckGo (no API key required)
+async function webSearch(query: string): Promise<string> {
+	try {
+		const resp = await axios.get('https://html.duckduckgo.com/html/', {
+			params: { q: query, kl: 'ru-ru' },
+			headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
+			timeout: 5000
+		});
+		const matches = resp.data.match(/<a class="result__snippet"[^>]*>(.*?)<\/a>/gs);
+		if (!matches || matches.length === 0) return '(no results found)';
+		const results = matches.slice(0, 5).map((m: string, i: number) => {
+			const text = m.replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&amp;/g, '&').trim();
+			return `${i + 1}. ${text}`;
+		});
+		return results.join('\n');
+	} catch (err: any) {
+		logger.warn({ error: err.message }, 'Web search failed');
+		return '(search failed)';
+	}
+}
+
+// Fetch URL content and extract readable text
+async function fetchUrlContent(url: string): Promise<string> {
+	try {
+		const resp = await axios.get(url, {
+			timeout: 5000,
+			maxRedirects: 3,
+			headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KrapralBot/1.0)' },
+			responseType: 'text'
+		});
+		const html = typeof resp.data === 'string' ? resp.data : '';
+		// Extract page title
+		const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+		const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+		// Extract meta description
+		const metaMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["'](.*?)["'][^>]*>/i)
+			|| html.match(/<meta[^>]*content=["'](.*?)["'][^>]*name=["']description["'][^>]*>/i);
+		const metaDesc = metaMatch ? metaMatch[1].trim() : '';
+		// Extract og:description
+		const ogMatch = html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["'](.*?)["'][^>]*>/i)
+			|| html.match(/<meta[^>]*content=["'](.*?)["'][^>]*property=["']og:description["'][^>]*>/i);
+		const ogDesc = ogMatch ? ogMatch[1].trim() : '';
+		// Extract article/main text (strip scripts, styles, tags)
+		const bodyMatch = html.match(/<(?:article|main)[^>]*>([\s\S]*?)<\/(?:article|main)>/i)
+			|| html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+		const bodyHtml = bodyMatch ? bodyMatch[1] : html;
+		const bodyText = bodyHtml
+			.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+			.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+			.replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+			.replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+			.replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+			.replace(/<[^>]+>/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.substring(0, 1500);
+
+		const parts = [];
+		if (title) parts.push(`Title: ${title}`);
+		if (metaDesc || ogDesc) parts.push(`Description: ${metaDesc || ogDesc}`);
+		if (bodyText) parts.push(`Content: ${bodyText}`);
+		return parts.join('\n') || '(could not extract content)';
+	} catch (err: any) {
+		logger.warn({ error: err.message, url }, 'URL fetch failed');
+		return `(failed to load: ${err.message})`;
+	}
+}
+
+// Build extra context from web search and URLs
+async function getWebContext(text: string): Promise<string | null> {
+	const urls = extractUrls(text);
+	const shouldSearch = needsWebSearch(text);
+
+	if (!shouldSearch && urls.length === 0) return null;
+
+	const parts: string[] = [];
+
+	// Fetch URL content in parallel
+	if (urls.length > 0) {
+		const urlResults = await Promise.all(urls.slice(0, 3).map(async (url) => {
+			const content = await fetchUrlContent(url);
+			return `[Content from ${url}]:\n${content}`;
+		}));
+		parts.push(...urlResults);
+	}
+
+	// Web search if needed
+	if (shouldSearch) {
+		const searchQuery = text
+			.replace(URL_PATTERN, '')
+			.replace(/^[@]?(капрал|крапрал|krapral|краб|крабчик|крамар)[,;:!.\s]*/gi, '')
+			.trim();
+		if (searchQuery.length > 3) {
+			const results = await webSearch(searchQuery);
+			parts.push(`[Web search results for "${searchQuery}"]:\n${results}`);
+		}
+	}
+
+	if (parts.length === 0) return null;
+	return parts.join('\n\n');
+}
+
 // Strip trigger words from user messages before sending to the model.
 // Users prefix messages with "крапрал" to address the bot — the model doesn't need to see this,
 // and repeated trigger words across messages can make Grok think the user is "repeating themselves".
@@ -308,7 +424,13 @@ function stripTriggerWords(text: string): string {
 }
 
 // Grok streaming response
-async function getKrapralStream(text: string, username: string) {
+async function getKrapralStream(text: string, username: string, webContext?: string | null) {
+	const userContent = `${getDisplayLabel(username)}: ${stripTriggerWords(text)}`;
+	// If we have web context, append it to the user message so Grok can reference it
+	const enrichedContent = webContext
+		? `${userContent}\n\n--- АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА (используй для ответа, но отвечай в своём стиле) ---\n${webContext}`
+		: userContent;
+
 	const messages = [
 		{ role: 'system' as const, content: IDENTITY },
 		...history.map(m => ({
@@ -318,7 +440,7 @@ async function getKrapralStream(text: string, username: string) {
 				? `${getDisplayLabel(m.name)}: ${stripTriggerWords(m.content)}`
 				: m.content
 		})),
-		{ role: 'user' as const, name: username, content: `${getDisplayLabel(username)}: ${stripTriggerWords(text)}` }
+		{ role: 'user' as const, name: username, content: enrichedContent }
 	];
 
 	const typedMessages = messages.map(m => ({
@@ -428,7 +550,13 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	try {
 		await ctx.sendChatAction('typing');
 
-		const result = await getKrapralStream(text, username);
+		// Fetch web context if message contains URLs or asks about current events
+		const webContext = await getWebContext(text);
+		if (webContext) {
+			logger.info(`[WEB CONTEXT] Fetched ${webContext.length} chars of web context for "${text.substring(0, 50)}"`);
+		}
+
+		const result = await getKrapralStream(text, username, webContext);
 		const { stream, model } = result;
 		logger.info(`Krapral replying to ${username} | Grok (${model})`);
 
