@@ -94,8 +94,17 @@ if (fs.existsSync(USERS_FILE)) {
 	}
 }
 
-// Map usernames to display names (learned from Telegram first_name)
-const displayNames: Record<string, string> = {};
+// Map usernames to display names (pre-seeded with known squad + learned from Telegram)
+const displayNames: Record<string, string> = {
+	'@FedotovAndrii': 'Капрон',
+	'@vinohradov': 'Андрій',
+	'@nehoroshevVl': 'Вован',
+	'@Ihorushka': 'Ігор',
+	'@ynddw': 'Пузань',
+	'@vinograd1ka': 'Виноградик',
+	'@olejatir': 'Олежатір',
+	'@Waltons777': 'Олег',
+};
 
 function updateDisplayName(user: any) {
 	if (user.username && user.first_name) {
@@ -591,6 +600,9 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, displayText);
 			} catch (ignore) { }
 		}
+
+		// Log response to Cloud Logging for debugging
+		logger.info(`[RESPONSE] to ${username}: "${fullResponse.substring(0, 200)}"`);
 
 		// Log full request
 		const originalMessages = [
