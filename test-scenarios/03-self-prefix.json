@@ -1,0 +1,29 @@
+{
+  "description": "Bot response should have @Krapral: prefix stripped in all variants.",
+  "history": [
+    { "role": "user", "name": "@vinohradov", "content": "[Андрій (@vinohradov)]: крапрал расскажи анекдот", "timestamp": 1709620000000 }
+  ],
+  "incoming": {
+    "from": { "id": 789, "username": "vinohradov", "first_name": "Андрій" },
+    "text": "крапрал расскажи анекдот",
+    "message_id": 70003,
+    "chat_type": "supergroup"
+  },
+  "simulated_raw_responses": [
+    "@Krapral: Сидит десантник в окопе...",
+    "@Krapral_bot: Значит, слушай, боец...",
+    "Крапрал: Заходит солдат в столовую...",
+    "@krapral: ну слушай, рядовой..."
+  ],
+  "expected_behavior": {
+    "should_reply": true,
+    "all_prefixes_must_be_stripped": true,
+    "clean_output_examples": [
+      "Сидит десантник в окопе...",
+      "Значит, слушай, боец...",
+      "Заходит солдат в столовую...",
+      "ну слушай, рядовой..."
+    ],
+    "notes": "cleanBotPrefix() must handle: @Krapral:, @Krapral_bot:, Крапрал:, @krapral: (case-insensitive, Latin+Cyrillic)"
+  }
+}

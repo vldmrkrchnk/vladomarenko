@@ -1,0 +1,27 @@
+{
+  "description": "5 messages happened while bot was silent. Bot should focus on the current question, not recap everything.",
+  "history": [
+    { "role": "assistant", "name": "@Krapral", "content": "Так точно, бойцы!", "timestamp": 1709630000000 },
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: пацаны видели новость про иран?", "timestamp": 1709630600000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: СЛАВА ИЗРАИЛЮ", "timestamp": 1709630660000 },
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: не надо было апгрейдить", "timestamp": 1709630720000 },
+    { "role": "user", "name": "@Waltons777", "content": "[Олег (@Waltons777)]: ПОКА!", "timestamp": 1709630780000 },
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: фаахха что блять", "timestamp": 1709630840000 }
+  ],
+  "incoming": {
+    "from": { "id": 456, "username": "nehoroshevVl", "first_name": "Вован" },
+    "text": "крапрал что думаешь про иран",
+    "message_id": 70004,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "address_user": "Вован",
+    "topic": "Iran (the question asked)",
+    "must_NOT_do": [
+      "Comment on Kapron's 'фаахха что блять' separately",
+      "Comment on Waltons' 'ПОКА!' separately"
+    ],
+    "notes": "Bot should answer Vovan's question about Iran. Mentioning Kapron who also talked about Iran in history is fine — they're in the same conversation. The key is bot shouldn't individually address every missed message."
+  }
+}

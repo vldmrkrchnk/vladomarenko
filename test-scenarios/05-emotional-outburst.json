@@ -1,0 +1,28 @@
+{
+  "description": "Short emotional outburst not directed at bot. Bot should stay silent (or at most react).",
+  "history": [
+    { "role": "assistant", "name": "@Krapral", "content": "Бывай, рядовой!", "timestamp": 1709640000000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: крапрал скажи что-нибудь про иран", "timestamp": 1709640060000 },
+    { "role": "assistant", "name": "@Krapral", "content": "Иран — это наши братья по контузии, боец.", "timestamp": 1709640120000 },
+    { "role": "user", "name": "@vinohradov", "content": "[Андрій (@vinohradov)]: ого", "timestamp": 1709640600000 },
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: лол", "timestamp": 1709640660000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: жесть", "timestamp": 1709640720000 },
+    { "role": "user", "name": "@olejatir", "content": "[Олежатір (@olejatir)]: ну такое", "timestamp": 1709640780000 },
+    { "role": "user", "name": "@Waltons777", "content": "[Олег (@Waltons777)]: да ладно", "timestamp": 1709640840000 }
+  ],
+  "incoming": {
+    "from": { "id": 123, "username": "FedotovAndrii", "first_name": "Капрон" },
+    "text": "фаахха что блять",
+    "message_id": 70005,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": false,
+    "reason": "Short emotional outburst (<5 words, no question mark), not addressed to bot. isBriefOutburst filter should catch this.",
+    "acceptable_alternative": "Silent context-aware reaction (e.g. 🤯 or 😱) at 15% probability",
+    "must_NOT_do": [
+      "Reply with text to this message",
+      "Comment on 'фаахха' as if it's a question"
+    ]
+  }
+}

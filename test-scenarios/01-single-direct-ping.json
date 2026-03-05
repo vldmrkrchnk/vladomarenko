@@ -1,0 +1,20 @@
+{
+  "description": "Single user pings Krapral directly. Bot should reply to the correct person.",
+  "history": [
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: Пацаны кто вечером?", "timestamp": 1709600000000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: я наверн буду", "timestamp": 1709600060000 },
+    { "role": "user", "name": "@vinohradov", "content": "[Андрій (@vinohradov)]: +", "timestamp": 1709600120000 }
+  ],
+  "incoming": {
+    "from": { "id": 123, "username": "nehoroshevVl", "first_name": "Вован" },
+    "text": "крапрал ты где пропал братишка",
+    "message_id": 70001,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "address_user": "Вован or @nehoroshevVl",
+    "should_NOT_prefix": "@Krapral:",
+    "notes": "Bot must reply to Vovan. Mentioning other users from history is OK — it's a group chat. The key is that the reply is directed at Vovan (who asked)."
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "description": "Vovan asks about another user. Bot should answer Vovan about Waltons.",
+  "history": [
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: фаахха что блять", "timestamp": 1709610000000 },
+    { "role": "user", "name": "@Waltons777", "content": "[Олег (@Waltons777)]: ПОКА!", "timestamp": 1709610060000 },
+    { "role": "assistant", "name": "@Krapral", "content": "Бывай, боец!", "timestamp": 1709610120000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: а чё с @Waltons777 случилось?", "timestamp": 1709610300000 },
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: хз", "timestamp": 1709610360000 },
+    { "role": "user", "name": "@vinohradov", "content": "[Андрій (@vinohradov)]: да норм всё", "timestamp": 1709610420000 },
+    { "role": "user", "name": "@nehoroshevVl", "content": "[Вован (@nehoroshevVl)]: ладно", "timestamp": 1709610480000 },
+    { "role": "user", "name": "@olejatir", "content": "[Олежатір (@olejatir)]: го в кс", "timestamp": 1709610540000 }
+  ],
+  "incoming": {
+    "from": { "id": 456, "username": "nehoroshevVl", "first_name": "Вован" },
+    "text": "крапрал что думаешь про @Waltons777",
+    "message_id": 70002,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "address_user": "Вован or @nehoroshevVl (the person asking)",
+    "should_talk_about": "@Waltons777 (the person being asked about)",
+    "notes": "Bot should answer Vovan's question about Waltons. Mentioning both is expected and correct — Vovan asked, Waltons is the subject."
+  }
+}

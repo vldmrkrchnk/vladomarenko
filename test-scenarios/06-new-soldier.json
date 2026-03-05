@@ -1,0 +1,22 @@
+{
+  "description": "Unknown user (not in users.json) sends a message. Bot should welcome them as a new recruit.",
+  "history": [
+    { "role": "user", "name": "@FedotovAndrii", "content": "[Капрон (@FedotovAndrii)]: о новенький", "timestamp": 1709650000000 }
+  ],
+  "incoming": {
+    "from": { "id": 999, "username": "RandomDude42", "first_name": "Паша" },
+    "text": "привет всем",
+    "message_id": 70006,
+    "chat_type": "supergroup"
+  },
+  "expected_behavior": {
+    "should_reply": true,
+    "trigger_rule": "Rule 2: new soldier not in users.json",
+    "address_user": "Паша or @RandomDude42",
+    "tone": "Welcome as new recruit, drill sergeant style",
+    "example_responses": [
+      "Рядовой @RandomDude42, на построение! Кто разрешал входить без доклада, «Тополь-М» мне в жопу?!",
+      "О, свежее мясо! Паша, значит? Зачислен в мой взвод, салабон. Калаш мне в зад!"
+    ]
+  }
+}
