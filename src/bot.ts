@@ -94,6 +94,21 @@ if (fs.existsSync(USERS_FILE)) {
 	}
 }
 
+// Map usernames to display names (learned from Telegram first_name)
+const displayNames: Record<string, string> = {};
+
+function updateDisplayName(user: any) {
+	if (user.username && user.first_name) {
+		displayNames[`@${user.username}`] = user.first_name;
+	}
+}
+
+function getDisplayLabel(username: string): string {
+	const displayName = displayNames[username];
+	if (displayName) return `[${displayName} (${username})]`;
+	return `[${username}]`;
+}
+
 // === MAIN PROTECTION FROM SPAM ON STARTUP ===
 const processedMessageIds = new Set<number>();
 
@@ -171,6 +186,14 @@ function shouldKrapralSpeak(username: string, text: string, chatType: string, ch
 		/\?/.test(m.content) ||
 		/\b(что|как|когда|где|почему|кто)\b/i.test(m.content)
 	);
+
+	// Skip short emotional outbursts not directed at the bot (rules 4 & 5)
+	const words = text.trim().split(/\s+/);
+	const isBriefOutburst = words.length < 5 && !lower.includes('?');
+	if (isBriefOutburst) {
+		logger.debug(`[SKIP] Short message without question from ${username}, not engaging`);
+		return false;
+	}
 
 	if (hasQuestion && messagesSinceLastResponse >= MIN_MESSAGES_BETWEEN_RESPONSES) {
 		logger.info(`[QUESTION] ${username} asked a question, ${messagesSinceLastResponse} messages passed → replying`);
@@ -268,9 +291,12 @@ function isEmptyResponse(text: string): boolean {
 	return !trimmed || /^\.{1,3}(\s*\(.*\))?$/.test(trimmed);
 }
 
-// Strip "@Krapral:" prefix that the model sometimes adds
+// Strip "@Krapral:" prefix that the model sometimes adds (Cyrillic + Latin variants)
 function cleanBotPrefix(text: string): string {
-	return text.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '').trim();
+	return text
+		.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '')
+		.replace(/^@?[Kk]rapral[_]?(?:bot)?[:\s]*/i, '')
+		.trim();
 }
 
 // Strip trigger words from user messages before sending to the model.
@@ -288,9 +314,11 @@ async function getKrapralStream(text: string, username: string) {
 		...history.map(m => ({
 			role: m.role as 'user' | 'assistant',
 			name: m.name,
-			content: m.role === 'user' ? stripTriggerWords(m.content) : m.content
+			content: m.role === 'user'
+				? `${getDisplayLabel(m.name)}: ${stripTriggerWords(m.content)}`
+				: m.content
 		})),
-		{ role: 'user' as const, name: username, content: stripTriggerWords(text) }
+		{ role: 'user' as const, name: username, content: `${getDisplayLabel(username)}: ${stripTriggerWords(text)}` }
 	];
 
 	const typedMessages = messages.map(m => ({
@@ -314,6 +342,27 @@ async function getKrapralStream(text: string, username: string) {
 		logger.error({ error: { message: err.message, status: err.status, type: err.type } }, 'Grok API error');
 		throw err;
 	}
+}
+
+// Context-aware reaction picker
+const REACTION_CATEGORIES: { pattern: RegExp; emojis: string[] }[] = [
+	{ pattern: /ахах|хах|лол|ржу|смех|😂|🤣|ору|кек|рофл/i, emojis: ['😂', '🤣', '💯', '😁', '🤡', '🥴'] },
+	{ pattern: /круто|огонь|пиздат|заеб|дерзк|топ|красав|мощ|жест|сильн|база/i, emojis: ['🔥', '💯', '🏆', '⚡', '👏', '🤩'] },
+	{ pattern: /люб|серд|брат|обним|спасиб|❤|молодец|горж/i, emojis: ['❤️', '❤️‍🔥', '🥰', '😍', '🤗', '💘'] },
+	{ pattern: /так точн|есть|доклад|слава|приказ|крапрал|капрал|отставить|строй|рядов/i, emojis: ['🫡', '👍', '👌', '🎖', '✍️'] },
+	{ pattern: /бля|хуй|пизд|ебат|что блять|охуе|нихуя|ёб|жесть|ппц|пиз/i, emojis: ['🤯', '😱', '🤬', '💀', '🗿', '😈'] },
+	{ pattern: /грус|печал|тоск|плох|хуёв|дерьм|устал|заеб/i, emojis: ['😢', '😭', '💔', '🙏'] },
+	{ pattern: /стикер|фото|видео|мем|картинк/i, emojis: ['👀', '🌚', '👾', '🤓'] },
+	{ pattern: /пить|пив|водк|вин|бухать|налив|виски|шот/i, emojis: ['🍾', '🍌', '🌭', '🥴'] },
+	{ pattern: /нарк|трав|дунуть|курн|солей|спид|марк/i, emojis: ['💊', '🌚', '😈', '🤪'] },
+];
+
+function pickContextReaction(text: string): string | null {
+	const lower = text.toLowerCase();
+	const matched = REACTION_CATEGORIES.filter(cat => cat.pattern.test(lower));
+	if (matched.length === 0) return null;
+	const category = matched[Math.floor(Math.random() * matched.length)];
+	return category.emojis[Math.floor(Math.random() * category.emojis.length)];
 }
 
 // === BOT SETUP ===
@@ -356,15 +405,16 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 	if (!shouldSpeak) {
 		logger.info(`[SILENT] Krapral not replying to "${text}" from ${username}`);
 
-		// 25% chance to put a silent reaction even when not replying
-		if (chatType !== 'private' && Math.random() < 0.25) {
-			const SILENT_REACTIONS = ['😂', '🔥', '👍', '🫡', '❤️', '👀', '🤔', '💯'];
-			const emoji = SILENT_REACTIONS[Math.floor(Math.random() * SILENT_REACTIONS.length)];
-			try {
-				await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji }]);
-				logger.info(`[SILENT REACTION] ${emoji} on message ${messageId} from ${username}`);
-			} catch (e: any) {
-				logger.warn({ error: e.message }, `Failed to set silent reaction ${emoji}`);
+		// 15% chance to put a context-aware silent reaction when not replying
+		if (chatType !== 'private' && Math.random() < 0.15) {
+			const emoji = pickContextReaction(text);
+			if (emoji) {
+				try {
+					await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji }]);
+					logger.info(`[SILENT REACTION] ${emoji} on message ${messageId} from ${username}`);
+				} catch (e: any) {
+					logger.warn({ error: e.message }, `Failed to set silent reaction ${emoji}`);
+				}
 			}
 		}
 
@@ -531,6 +581,7 @@ bot.on('text', async (ctx) => {
 	// Ignore own messages (prevent self-reply loops)
 	if (msg.from?.is_bot && msg.from?.id === bot.botInfo?.id) return;
 	const messageId = msg.message_id;
+	updateDisplayName(msg.from);
 	const username = formatName(msg.from);
 	let text = msg.text.trim();
 	const chatType = ctx.chat.type;
@@ -550,6 +601,7 @@ async function handleAudioTranscription(ctx: any) {
 	const msg = ctx.message;
 	if (!msg) return;
 	const messageId = msg.message_id;
+	updateDisplayName(ctx.from);
 	const username = formatName(ctx.from);
 	const chatType = ctx.chat.type;
 
@@ -605,6 +657,7 @@ bot.on('sticker', async (ctx) => {
 	if (msg.from?.is_bot && msg.from?.id === bot.botInfo?.id) return;
 	const emoji = msg.sticker.emoji || '?';
 	const messageId = msg.message_id;
+	updateDisplayName(msg.from);
 	const username = formatName(msg.from);
 	const chatType = ctx.chat.type;
 	await handleIncomingText(ctx, `[STICKER: ${emoji}]`, username, messageId, chatType);
