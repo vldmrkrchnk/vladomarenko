@@ -39,17 +39,19 @@ src/bot.ts              Main bot implementation (~620 lines)
 identity.txt            Character system prompt
 users.json              User profiles (roles, triggers, relationships)
 last_50.json            Message history (auto-generated, last 50)
-.env                    Production env (prod bot token)
-.env.local              Development env (dev bot token)
+.env                    Production env (not committed)
+.env.local              Development env (not committed)
+.env.example            Template — copy to .env.local and fill in
 docs/                   Documentation
+  DEVELOPMENT.md        Local dev setup + conventions
+  DEPLOYMENT.md         Fly.io deploy flow
   ARCHITECTURE.md       Bot architecture and data flow
-  DEPLOYMENT.md         GCP deployment guide
-  QUICK_START.md        Quick deploy reference
-  ROLLBACK.md           Rollback procedures
-ecosystem.config.js     PM2 config (VM deploys)
+  DEPLOYMENT-GCLOUD.md  Archived legacy Google Cloud Run setup
+ecosystem.config.js     PM2 config (VM deploys, unused)
 Dockerfile              Docker build
 fly.toml                Fly.io deploy config (active)
-cloudbuild.yaml         Cloud Build CI/CD (legacy GCP)
+.github/workflows/      CI — auto-deploy on merge to main
+cloudbuild.yaml         Cloud Build CI/CD (legacy GCP, unused)
 ```
 
 ## AI Models
