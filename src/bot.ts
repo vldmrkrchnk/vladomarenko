@@ -304,7 +304,15 @@ function isEmptyResponse(text: string): boolean {
 function cleanBotPrefix(text: string): string {
 	return text
 		.replace(/^(@?[Кк]р[аa]пр[аa]л[:\s]*)+/i, '')
-		.replace(/^@?[Kk]rapral[_]?(?:bot)?[:\s]*/i, '')
+		.replace(/^(@?[Kk]rapral[_]?(?:bot)?[:\s]*)+/i, '')
+		.trim();
+}
+
+// Strip [REACT:...] / [POLL:...] tags for display — they're extracted and acted on separately
+function stripActionTags(text: string): string {
+	return text
+		.replace(/\[REACT:[^\]]+\]/g, '')
+		.replace(/\[POLL:[^\]]+\]/g, '')
 		.trim();
 }
 
@@ -584,7 +592,7 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 
 				if (now - lastEditTime > 1500 || buffer.length > 50) {
 					try {
-						const displayText = cleanBotPrefix(fullResponse) || '...';
+						const displayText = stripActionTags(cleanBotPrefix(fullResponse)) || '...';
 						await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, displayText);
 						lastEditTime = now;
 						buffer = '';
@@ -593,10 +601,10 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 			}
 		}
 
-		// Final update with cleaned text
+		// Final update with cleaned text (tags stripped so partial streams don't leak them)
 		if (fullResponse && buffer.length > 0) {
 			try {
-				const displayText = cleanBotPrefix(fullResponse) || '...';
+				const displayText = stripActionTags(cleanBotPrefix(fullResponse)) || '...';
 				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, displayText);
 			} catch (ignore) { }
 		}
@@ -637,55 +645,51 @@ async function handleIncomingText(ctx: any, text: string, username: string, mess
 		return;
 	}
 
-	// Update the message with cleaned response
-	if (sentMessageInfo) {
-		try {
-			await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, fullResponse);
-		} catch (ignore) { }
-	}
-
+	// Extract action tags FIRST (before touching the placeholder), so raw tags never reach the user
 	let responseText = fullResponse;
 	let actionDescription = '';
 
-	// 1. Handle reactions: [REACT:emoji]
 	const reactMatch = responseText.match(/\[REACT:(.+?)\]/);
-	if (reactMatch) {
-		const emoji = reactMatch[1].trim();
-		responseText = responseText.replace(reactMatch[0], '').trim();
+	const reactEmoji = reactMatch ? reactMatch[1].trim() : null;
+	if (reactMatch) responseText = responseText.replace(reactMatch[0], '').trim();
 
-		if (responseText && sentMessageInfo) {
-			// Text + reaction: update the message with the text part
+	const pollMatch = responseText.match(/\[POLL:(.+?)\]/);
+	const pollContent = pollMatch ? pollMatch[1] : null;
+	if (pollMatch) responseText = responseText.replace(pollMatch[0], '').trim();
+
+	// Commit the placeholder: edit to cleaned text, or delete if nothing left after stripping tags
+	if (sentMessageInfo) {
+		if (responseText) {
 			try {
 				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText);
-			} catch (e) { }
-		} else if (!responseText && sentMessageInfo) {
-			// Reaction-only: delete the placeholder message
+			} catch (ignore) { }
+		} else {
+			// Tag-only response (e.g., [REACT:🔥] with no text) — delete the placeholder so it doesn't leak
 			try {
 				await ctx.telegram.deleteMessage(ctx.chat.id, sentMessageInfo.message_id);
-			} catch (e) { }
-		}
-
-		try {
-			await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji }]);
-			logger.info(`[REACTION] Set reaction ${emoji} to message ${messageId}`);
-			if (!responseText) actionDescription = `(Reaction: ${emoji})`;
-		} catch (e: any) {
-			logger.warn({ error: e.message }, `Failed to set reaction ${emoji}`);
+				sentMessageInfo = null;
+			} catch (ignore) {
+				// Fallback: if delete fails, hide the raw tags under an unobtrusive "..."
+				try {
+					await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, '...');
+				} catch (e2) { }
+			}
 		}
 	}
 
-	// 2. Handle polls: [POLL:Question|Option1|Option2]
-	const pollMatch = responseText.match(/\[POLL:(.+?)\]/);
-	if (pollMatch) {
-		const pollContent = pollMatch[1];
-		responseText = responseText.replace(pollMatch[0], '').trim();
-
-		if (sentMessageInfo) {
-			try {
-				await ctx.telegram.editMessageText(ctx.chat.id, sentMessageInfo.message_id, undefined, responseText || '...');
-			} catch (e) { }
+	// Apply reaction (if we extracted one)
+	if (reactEmoji) {
+		try {
+			await ctx.telegram.setMessageReaction(ctx.chat.id, messageId, [{ type: 'emoji', emoji: reactEmoji }]);
+			logger.info(`[REACTION] Set reaction ${reactEmoji} to message ${messageId}`);
+			if (!responseText) actionDescription = `(Reaction: ${reactEmoji})`;
+		} catch (e: any) {
+			logger.warn({ error: e.message }, `Failed to set reaction ${reactEmoji}`);
 		}
+	}
 
+	// Create poll (if we extracted one)
+	if (pollContent) {
 		const parts = pollContent.split('|').map(p => p.trim()).filter(p => p);
 		if (parts.length >= 3) {
 			const question = parts[0];
