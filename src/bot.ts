@@ -818,16 +818,27 @@ const server = http.createServer(async (req, res) => {
 	if (req.url === '/webhook' && req.method === 'POST') {
 		let body = '';
 		req.on('data', (chunk: any) => { body += chunk.toString(); });
-		req.on('end', async () => {
+		req.on('end', () => {
+			// Respond 200 IMMEDIATELY so Telegram never retries a slow handler.
+			// Slow handler = duplicate webhook deliveries = bot replying twice
+			// and complaining that the user is "repeating themselves".
+			res.writeHead(200, { 'Content-Type': 'text/plain' });
+			res.end('OK');
+
+			// Process asynchronously — errors logged, not returned.
+			let update: any;
 			try {
-				await bot.handleUpdate(JSON.parse(body));
-				res.writeHead(200, { 'Content-Type': 'text/plain' });
-				res.end('OK');
-			} catch (err) {
-				logger.error({ error: err }, 'Webhook error');
-				res.writeHead(500, { 'Content-Type': 'text/plain' });
-				res.end('Error');
+				update = JSON.parse(body);
+			} catch (e) {
+				logger.error({ error: e }, 'Webhook: invalid JSON body');
+				return;
 			}
+			const updateId = update?.update_id;
+			const msgId = update?.message?.message_id ?? update?.edited_message?.message_id;
+			logger.debug(`[WEBHOOK] update_id=${updateId} message_id=${msgId}`);
+			bot.handleUpdate(update).catch(err => {
+				logger.error({ error: err, updateId, msgId }, 'Webhook handleUpdate error');
+			});
 		});
 		return;
 	}
