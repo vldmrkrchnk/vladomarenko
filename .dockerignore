@@ -2,6 +2,7 @@ node_modules
 dist
 *.log
 .env
+.env.local
 .git
 .gitignore
 README.md
@@ -13,4 +14,7 @@ ecosystem.config.js
 last_50.json
 grok_requests.log
 openai_requests.log
+ChatExport_*
+test-scenarios
+fly.toml
 

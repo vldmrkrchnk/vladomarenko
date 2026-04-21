@@ -10,7 +10,7 @@ Telegram bot that embodies "Krapral" - a fictional shell-shocked ex-VDV sergeant
 - **Emoji reactions** and **poll creation** via `[REACT:emoji]` / `[POLL:Q|A|B]` tags
 - **Censorship filtering** - detects and silently suppresses AI refusals
 - **Dev mode** - separate bot token with console-only logging
-- **Production ready** - Docker, Cloud Run, PM2, structured logging (pino)
+- **Production ready** - Docker, Fly.io, PM2, structured logging (pino)
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ npm run build
 npm start
 ```
 
-See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) for Google Cloud deployment.
+See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) for Fly.io deployment (active) or [docs/DEPLOYMENT-GCLOUD.md](./docs/DEPLOYMENT-GCLOUD.md) for the legacy Google Cloud Run setup.
 
 ## Project Structure
 
@@ -43,9 +43,10 @@ docs/                   Documentation
   DEPLOYMENT.md         GCP deployment guide
   QUICK_START.md        Quick deploy reference
   ROLLBACK.md           Rollback procedures
-ecosystem.config.js     PM2 config
+ecosystem.config.js     PM2 config (VM deploys)
 Dockerfile              Docker build
-cloudbuild.yaml         Cloud Build CI/CD
+fly.toml                Fly.io deploy config (active)
+cloudbuild.yaml         Cloud Build CI/CD (legacy GCP)
 ```
 
 ## AI Models
@@ -79,7 +80,8 @@ cloudbuild.yaml         Cloud Build CI/CD
 ## Documentation
 
 - [Architecture](./docs/ARCHITECTURE.md) - how the bot works
-- [Deployment](./docs/DEPLOYMENT.md) - GCP deployment guide
+- [Deployment](./docs/DEPLOYMENT.md) - Fly.io deployment guide (active)
+- [Deployment (legacy GCP)](./docs/DEPLOYMENT-GCLOUD.md) - old Google Cloud Run setup
 - [Quick Start](./docs/QUICK_START.md) - quick deploy reference
 - [Rollback](./docs/ROLLBACK.md) - rollback procedures
 
