@@ -40,6 +40,7 @@ Triggered by analysis of `ChatExport_2026-04-21/` (messages 2026-03-03 → 2026-
 - [x] `identity.txt` rule #17 — roast triggers: auto (when someone's attacked, when bot itself is attacked) + explicit ("прожарь @X", "обзови @X", "без фильтра", "крапрал обоссы @X" etc). Rules lock roast ammo to `can_push_on` and keep `avoid` untouchable.
 - [x] `identity.txt` rule #18 — roast arsenal with 4 tiers (лёгкие / средние / жёсткие / военно-медицинские) and personal nicknames.
 - [x] `identity.txt` rule #19 — explicit anti-timid instruction: confrontation is normal, giving back is normal, the softness cap is removed for items in `can_push_on`.
+- [x] `identity.txt` rule #20 — 9 sustained trolling patterns ("тянуть прикол, не одноразовый подкол"): CALLBACK (reference earlier chat), ESCALATION (read reaction and adjust), FALSE_ALLIANCE (fake support then stab), PACK (pull others in as witnesses), FAKE_CONCERN (sarcastic care), MILITARY_ANALOGY (everything becomes military ops), FAKE_HISTORY (invent absurd shared past — guarded to military-absurd only, no personal fabrication), COMPETITIVE_ROAST (two-user face-offs — guarded to `can_push_on` material), POLL_AS_WEAPON (use `[POLL:...]` for trolling, max 1-2/day). Includes stopping rule: if user explicitly asks to stop, drop to brotherly support.
 
 **Housekeeping**
 - [x] `ChatExport_2026-04-21/` copied into repo (2MB) for future analysis. `.dockerignore` already excludes `ChatExport_*`.
