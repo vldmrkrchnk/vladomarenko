@@ -66,19 +66,84 @@ If you're looking for the old Google Cloud Run instructions, see [DEPLOYMENT-GCL
 
    Then message the bot on Telegram to confirm it responds.
 
-## Subsequent deploys (any developer, per change)
+## Deploying a change (daily flow)
 
-From a clean checkout on any branch:
+Assumes the first-time setup above is done and `krapral-bot` is live on Fly.
+
+### What a developer does
+
+1. **Work locally first.** Run `npm run dev:mode` against your own dev bot — see [DEVELOPMENT.md](./DEVELOPMENT.md). Never deploy code to prod that hasn't been tested against a dev bot.
+
+2. **Make a branch and PR.** Branch off `main`, commit, open a PR against `main`, get review if the team requires it, merge.
+
+3. **Pull and deploy.**
+   ```bash
+   git checkout main
+   git pull
+   fly deploy
+   ```
+
+   Fly builds the current working tree on a remote builder, pushes the image, rolls the machine to the new image, and runs health checks. Takes ~2–4 minutes. The CLI streams output; the last line will say `✓ deployed`.
+
+4. **Verify.**
+   ```bash
+   fly status                          # machine is "started", check "passing"
+   fly logs                            # look for "Webhook set to: ..." and no errors
+   curl https://krapral-bot.fly.dev/health
+   ```
+
+   Then send a message to the bot in Telegram. It should reply.
+
+5. **If something breaks, roll back immediately:**
+   ```bash
+   fly releases
+   fly releases rollback <version>
+   ```
+   See [Rollback](#rollback) below.
+
+### Who can deploy
+
+Anyone with access to the Fly `krapral-bot` app. Invite a collaborator via the Fly dashboard (https://fly.io/dashboard → Members) or CLI:
 
 ```bash
-fly deploy
+fly orgs invite personal <email>
 ```
 
-That's it. Fly builds the current working tree, rolls the machine to the new image, and performs a health check. Rollback is one command (see below).
+Each invited dev runs `fly auth login` locally to authenticate.
+
+### Optional: auto-deploy on merge to `main` via GitHub Actions
+
+Instead of `fly deploy` from each dev's machine, CI deploys on push to `main`. Setup:
+
+1. Create a Fly deploy token:
+   ```bash
+   fly tokens create deploy -a krapral-bot
+   ```
+2. Add it to the GitHub repo: **Settings → Secrets and variables → Actions → New repository secret** → name `FLY_API_TOKEN`, paste the token.
+3. Add `.github/workflows/fly-deploy.yml`:
+   ```yaml
+   name: Deploy to Fly
+
+   on:
+     push:
+       branches: [main]
+
+   jobs:
+     deploy:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: superfly/flyctl-actions/setup-flyctl@master
+         - run: flyctl deploy --remote-only
+           env:
+             FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+   ```
+
+After that, merging to `main` triggers a deploy. Devs don't need `flyctl` installed or Fly access — they just merge a PR.
 
 ### Canary / preview deploys
 
-Not set up by default. If you need to test changes without touching prod, create a separate app (e.g. `krapral-bot-dev`) with its own `fly.toml`, deploy there, and point a separate Telegram dev bot token at it.
+Not set up by default. If you want to test on prod-like infra without touching the live bot, create a separate Fly app (e.g. `fly apps create krapral-bot-staging`), give it its own `fly.toml` and its own Telegram dev token, and `fly deploy -c fly.staging.toml`.
 
 ## Managing secrets
 

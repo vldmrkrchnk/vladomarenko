@@ -16,18 +16,21 @@ Telegram bot that embodies "Krapral" - a fictional shell-shocked ex-VDV sergeant
 
 ```bash
 npm install
-npm run dev:local     # dev bot token, normal logging
-npm run dev:mode      # dev bot token, console-only logging
+cp .env.example .env.local   # then fill in your dev bot token + API keys
+npm run dev:mode             # dev bot token, console-only logging
 ```
 
-## Production
+See **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)** for the full local setup — creating your own test bot, API keys, conventions.
+
+## Deploying
 
 ```bash
-npm run build
-npm start
+fly deploy
 ```
 
-See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) for Fly.io deployment (active) or [docs/DEPLOYMENT-GCLOUD.md](./docs/DEPLOYMENT-GCLOUD.md) for the legacy Google Cloud Run setup.
+See **[docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)** for the full deploy flow, rollback, and CI setup.
+
+Legacy Google Cloud Run guide: [docs/DEPLOYMENT-GCLOUD.md](./docs/DEPLOYMENT-GCLOUD.md) (archive — the active host is Fly.io).
 
 ## Project Structure
 
@@ -79,11 +82,10 @@ cloudbuild.yaml         Cloud Build CI/CD (legacy GCP)
 
 ## Documentation
 
-- [Architecture](./docs/ARCHITECTURE.md) - how the bot works
-- [Deployment](./docs/DEPLOYMENT.md) - Fly.io deployment guide (active)
-- [Deployment (legacy GCP)](./docs/DEPLOYMENT-GCLOUD.md) - old Google Cloud Run setup
-- [Quick Start](./docs/QUICK_START.md) - quick deploy reference
-- [Rollback](./docs/ROLLBACK.md) - rollback procedures
+- [Development](./docs/DEVELOPMENT.md) - local setup, running the bot against your own test bot
+- [Deployment](./docs/DEPLOYMENT.md) - Fly.io deploy flow, rollback, optional CI
+- [Architecture](./docs/ARCHITECTURE.md) - how the bot works internally
+- [Deployment (legacy GCP)](./docs/DEPLOYMENT-GCLOUD.md) - archived Google Cloud Run setup
 
 ## License
 
